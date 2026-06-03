@@ -1,0 +1,30 @@
+# Build files
+build/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+
+# Cache files
+.cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# IDE and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Local/scratch folders
+scratch/
+
+# Test generated/bloat files
+test/schemas/bloat/
+test/schemas/bloat_embeddings.npz
+test/schemas/bloat_metadata.json
+test/schemas/test.db
+*.atb
+

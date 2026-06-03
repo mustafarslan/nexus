@@ -1,0 +1,41 @@
+{
+  "name": "query_nexus_database",
+  "description": "Performs an advanced structured search query across the central Nexus cluster logs, with sorting and paging capabilities.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "query_string": {
+        "type": "string",
+        "description": "SQL-like filter expression to match against database logs."
+      },
+      "limit": {
+        "type": "integer",
+        "default": 50,
+        "description": "Maximum number of rows to return."
+      },
+      "offset": {
+        "type": "integer",
+        "default": 0,
+        "description": "Number of rows to skip."
+      },
+      "sort_by": {
+        "type": "string",
+        "enum": ["timestamp", "severity", "component"],
+        "default": "timestamp"
+      },
+      "filters": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "field": { "type": "string" },
+            "operator": { "type": "string", "enum": ["eq", "like", "gt", "lt"] },
+            "value": { "type": "string" }
+          },
+          "required": ["field", "operator", "value"]
+        }
+      }
+    },
+    "required": ["query_string"]
+  }
+}

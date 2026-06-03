@@ -1,0 +1,248 @@
+diff --git a/include/llama.h b/include/llama.h
+index c57d21f0c..97f68f8c4 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -624,6 +624,10 @@ extern "C" {
+                        llama_pos   p0,
+                        llama_pos   p1);
+ 
++    LLAMA_API int32_t llama_kv_cache_get_physical_pos(
++            struct llama_context * ctx,
++                        llama_pos   pos);
++
+     // Copy all tokens that belong to the specified sequence to another sequence
+     // Note that this does not allocate extra KV cache memory - it simply assigns the tokens to the new sequence
+     // p0 < 0 : [0,  p1]
+@@ -653,6 +657,20 @@ extern "C" {
+                        llama_pos   p1,
+                        llama_pos   delta);
+ 
++    // Shifts the positions and immediately updates the KV cache on GPU / rotates RoPE embeddings
++    LLAMA_API void llama_kv_cache_seq_shift(
++            struct llama_context * ctx,
++                     llama_seq_id   seq_id,
++                        llama_pos   p0,
++                        llama_pos   p1,
++                        llama_pos   delta);
++
++    LLAMA_API bool llama_register_host_memory(void * buffer, size_t size);
++    LLAMA_API void llama_unregister_host_memory(void * buffer);
++    LLAMA_API void llama_kv_cache_rope_shift_gpu(struct llama_context * ctx, int32_t p, int32_t seq_len, int32_t delta_pos);
++    LLAMA_API bool llama_context_is_metal(struct llama_context * ctx);
++    LLAMA_API bool llama_context_is_cuda(struct llama_context * ctx);
++
+     // Integer division of the positions by factor of `d > 1`
+     // If the KV cache is RoPEd, the KV data is updated accordingly:
+     //   - lazily on next llama_decode()
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 07bb42713..c470797b8 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -2483,6 +2483,7 @@ struct llama_kv_cell {
+     llama_pos pos   = -1;
+     llama_pos delta = 0;
+     int32_t   src   = 0; // used by recurrent state models to copy states
++    int32_t   p     = -1; // physical index
+ 
+     std::set<llama_seq_id> seq_id;
+ 
+@@ -3021,6 +3022,9 @@ static bool llama_kv_cache_init(
+ 
+     cache.cells.clear();
+     cache.cells.resize(kv_size);
++    for (uint32_t i = 0; i < kv_size; ++i) {
++        cache.cells[i].p = i;
++    }
+ 
+     if (cache.recurrent) {
+         // init state copy sources
+@@ -19773,6 +19777,15 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
+     return llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+ }
+ 
++int32_t llama_kv_cache_get_physical_pos(struct llama_context * ctx, llama_pos pos) {
++    for (uint32_t i = 0; i < ctx->kv_self.cells.size(); ++i) {
++        if (ctx->kv_self.cells[i].pos == pos && !ctx->kv_self.cells[i].is_empty()) {
++            return ctx->kv_self.cells[i].p;
++        }
++    }
++    return -1;
++}
++
+ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+     if (seq_id_src == seq_id_dst) {
+         return;
+@@ -21822,3 +21835,161 @@ static void llama_log_callback_default(ggml_log_level level, const char * text,
+     fputs(text, stderr);
+     fflush(stderr);
+ }
++
++void llama_kv_cache_seq_shift(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
++    llama_kv_cache_seq_add(ctx, seq_id, p0, p1, delta);
++    llama_kv_cache_update(ctx);
++}
++
++// Bridge functions for Project Nexus Offline KV Compiler
++extern "C" {
++    LLAMA_API struct ggml_tensor * llama_kv_cache_get_k(struct llama_context * ctx, int il) {
++        return ctx->kv_self.k_l[il];
++    }
++    LLAMA_API struct ggml_tensor * llama_kv_cache_get_v(struct llama_context * ctx, int il) {
++        return ctx->kv_self.v_l[il];
++    }
++    LLAMA_API bool llama_kv_cache_get_v_trans(struct llama_context * ctx) {
++        return ctx->kv_self.v_trans;
++    }
++    LLAMA_API uint32_t llama_kv_cache_get_size(struct llama_context * ctx) {
++        return ctx->kv_self.size;
++    }
++    LLAMA_API uint32_t llama_model_n_head_kv(const struct llama_model * model, int il) {
++        return model->hparams.n_head_kv_arr[il];
++    }
++    LLAMA_API uint32_t llama_model_d_head(const struct llama_model * model) {
++        return model->hparams.n_embd_head_k;
++    }
++    LLAMA_API float llama_model_rope_freq_base(const struct llama_model * model) {
++        return model->hparams.rope_freq_base_train;
++    }
++    LLAMA_API float llama_model_rope_freq_scale(const struct llama_model * model) {
++        return model->hparams.rope_freq_scale_train;
++    }
++    LLAMA_API uint32_t llama_model_rope_scaling_type(const struct llama_model * model) {
++        return (uint32_t) model->hparams.rope_scaling_type_train;
++    }
++    LLAMA_API const char * llama_model_name(const struct llama_model * model) {
++        return model->name.c_str();
++    }
++    LLAMA_API float llama_context_yarn_ext_factor(const struct llama_context * ctx) {
++        return ctx->cparams.yarn_ext_factor;
++    }
++    LLAMA_API float llama_context_yarn_beta_fast(const struct llama_context * ctx) {
++        return ctx->cparams.yarn_beta_fast;
++    }
++    LLAMA_API float llama_context_yarn_beta_slow(const struct llama_context * ctx) {
++        return ctx->cparams.yarn_beta_slow;
++    }
++    LLAMA_API uint32_t llama_context_yarn_n_ctx_orig(const struct llama_context * ctx) {
++        return ctx->cparams.n_ctx_orig_yarn;
++    }
++    LLAMA_API void llama_tensor_set_async(struct llama_context * ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++        ggml_backend_t backend = nullptr;
++        if (ctx && !ctx->backends.empty()) {
++            backend = ctx->backends[0];
++        }
++        if (backend && tensor->buffer) {
++            ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
++        } else {
++            ggml_backend_tensor_set(tensor, data, offset, size);
++        }
++    }
++    LLAMA_API void llama_backend_sync(struct llama_context * ctx) {
++        ggml_backend_t backend = nullptr;
++        if (ctx && !ctx->backends.empty()) {
++            backend = ctx->backends[0];
++        }
++        if (backend) {
++            ggml_backend_synchronize(backend);
++        }
++    }
++    LLAMA_API void llama_kv_cache_set_cell(struct llama_context * ctx, uint32_t cell_idx, llama_pos pos, llama_seq_id seq_id) {
++        if (cell_idx < ctx->kv_self.cells.size()) {
++            bool was_empty = ctx->kv_self.cells[cell_idx].is_empty();
++            
++            ctx->kv_self.cells[cell_idx].pos = pos;
++            ctx->kv_self.cells[cell_idx].delta = 0;
++            ctx->kv_self.cells[cell_idx].seq_id.clear();
++            ctx->kv_self.cells[cell_idx].seq_id.insert(seq_id);
++            
++            bool is_empty = ctx->kv_self.cells[cell_idx].is_empty();
++            if (was_empty && !is_empty) {
++                ctx->kv_self.used++;
++            } else if (!was_empty && is_empty) {
++                ctx->kv_self.used--;
++            }
++        }
++    }
++
++    LLAMA_API bool llama_register_host_memory(void * buffer, size_t size) {
++#ifdef GGML_USE_CUDA
++        return ggml_backend_cuda_register_host_buffer(buffer, size);
++#else
++        (void) buffer;
++        (void) size;
++        return true;
++#endif
++    }
++
++    LLAMA_API void llama_unregister_host_memory(void * buffer) {
++#ifdef GGML_USE_CUDA
++        ggml_backend_cuda_unregister_host_buffer(buffer);
++#else
++        (void) buffer;
++#endif
++    }
++
++    LLAMA_API void llama_kv_cache_rope_shift_gpu(struct llama_context * ctx, int32_t p, int32_t seq_len, int32_t delta_pos) {
++        if (delta_pos == 0) return;
++        
++        std::vector<int32_t> old_deltas(ctx->kv_self.size);
++        for (uint32_t i = 0; i < ctx->kv_self.size; ++i) {
++            old_deltas[i] = ctx->kv_self.cells[i].delta;
++            ctx->kv_self.cells[i].delta = 0;
++        }
++        
++        for (int32_t i = 0; i < seq_len; ++i) {
++            uint32_t cell_idx = (p + i) % ctx->kv_self.size;
++            ctx->kv_self.cells[cell_idx].delta = delta_pos;
++        }
++        
++        ggml_backend_sched_reset(ctx->sched);
++        struct ggml_cgraph * gf = llama_build_graph_k_shift(*ctx);
++        ggml_backend_sched_alloc_graph(ctx->sched, gf);
++        llama_set_k_shift(*ctx);
++        llama_graph_compute(*ctx, gf, ctx->cparams.n_threads);
++        
++        for (uint32_t i = 0; i < ctx->kv_self.size; ++i) {
++            ctx->kv_self.cells[i].delta = old_deltas[i];
++        }
++    }
++
++    LLAMA_API bool llama_context_is_metal(struct llama_context * ctx) {
++        ggml_backend_t backend = nullptr;
++        if (ctx && !ctx->backends.empty()) {
++            backend = ctx->backends[0];
++        }
++        if (backend) {
++#ifdef GGML_USE_METAL
++            return ggml_backend_is_metal(backend);
++#endif
++        }
++        return false;
++    }
++
++    LLAMA_API bool llama_context_is_cuda(struct llama_context * ctx) {
++        ggml_backend_t backend = nullptr;
++        if (ctx && !ctx->backends.empty()) {
++            backend = ctx->backends[0];
++        }
++        if (backend) {
++#ifdef GGML_USE_CUDA
++            return ggml_backend_is_cuda(backend);
++#endif
++        }
++        return false;
++    }
++}
++
+diff --git a/src/unicode.cpp b/src/unicode.cpp
+index e05fb9d17..e2f3f6b7d 100644
+--- a/src/unicode.cpp
++++ b/src/unicode.cpp
+@@ -5,6 +5,7 @@
+ #include "unicode.h"
+ #include "unicode-data.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cstddef>
+ #include <cstdint>

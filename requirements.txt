@@ -1,0 +1,4 @@
+mcp>=1.0.0
+llama-cpp-python>=0.2.75
+numpy>=1.20.0
+rich>=13.0.0

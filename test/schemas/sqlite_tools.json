@@ -1,0 +1,130 @@
+{
+  "meta": null,
+  "nextCursor": null,
+  "tools": [
+    {
+      "name": "read_query",
+      "title": null,
+      "description": "Execute a SELECT query on the SQLite database",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "SELECT SQL query to execute"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "write_query",
+      "title": null,
+      "description": "Execute an INSERT, UPDATE, or DELETE query on the SQLite database",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "SQL query to execute"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "create_table",
+      "title": null,
+      "description": "Create a new table in the SQLite database",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "CREATE TABLE SQL statement"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "list_tables",
+      "title": null,
+      "description": "List all tables in the SQLite database",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "describe_table",
+      "title": null,
+      "description": "Get the schema information for a specific table",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table_name": {
+            "type": "string",
+            "description": "Name of the table to describe"
+          }
+        },
+        "required": [
+          "table_name"
+        ]
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "append_insight",
+      "title": null,
+      "description": "Add a business insight to the memo",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "insight": {
+            "type": "string",
+            "description": "Business insight discovered from data analysis"
+          }
+        },
+        "required": [
+          "insight"
+        ]
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    }
+  ]
+}
