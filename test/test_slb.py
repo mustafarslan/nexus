@@ -116,9 +116,45 @@ def test_slb_invalid_dimension():
         
     print("test_slb_invalid_dimension passed successfully!")
 
+def test_slb_hysteresis_thrashing():
+    print("Running test_slb_hysteresis_thrashing...")
+    
+    large_dim = 70000
+    slb_large = NexusSemanticSLB(large_dim)
+    
+    vec_large = np.zeros(large_dim, dtype=np.float32)
+    scent_large = [1] * 5
+    slb_large.register_tool(1, vec_large, scent_large)
+    
+    # Inflate thread-local scratch buffer above 64KB
+    slb_large.search(vec_large, top_k=1)
+    
+    small_dim = 32
+    slb_small = NexusSemanticSLB(small_dim)
+    vec_small = np.zeros(small_dim, dtype=np.float32)
+    scent_small = [2] * 5
+    slb_small.register_tool(2, vec_small, scent_small)
+    
+    # Run under-threshold (50) searches
+    for _ in range(50):
+        slb_small.search(vec_small, top_k=1)
+        
+    # Large search should not need reallocation
+    slb_large.search(vec_large, top_k=1)
+    
+    # Exceed threshold (>100 consecutive underutilizations)
+    for _ in range(60):
+        slb_small.search(vec_small, top_k=1)
+        
+    # Large search will reallocate
+    slb_large.search(vec_large, top_k=1)
+    
+    print("test_slb_hysteresis_thrashing passed successfully!")
+
 if __name__ == "__main__":
     test_slb_basic()
     test_slb_quantization_precision()
     test_slb_invalid_dimension()
+    test_slb_hysteresis_thrashing()
     print("All SLB tests passed successfully!")
 

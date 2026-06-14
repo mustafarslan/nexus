@@ -16,6 +16,10 @@
 #include "nexus_block_cache.hpp"
 #include "nexus_rope_math.hpp"
 #include "nexus_os_compat.hpp"
+#include "nexus_slb.hpp"
+#include "nexus_fsm.hpp"
+#include "nexus_kv_splicer.hpp"
+#include "nexus_benchmark_results.hpp"
 
 extern "C" {
     uint32_t llama_model_n_head_kv(const struct llama_model * model, int il);
@@ -132,56 +136,20 @@ double run_real_prefill_baseline(llama_context* ctx, uint32_t n_tokens) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-// Spliced path measuring: block caching, prefetching, async PCIe transfer, GPU RoPE shift, and synchronization
 double run_nexus_splicer_benchmark(NexusBlockCache& cache, const std::string& atb_path, llama_context* ctx, uint32_t n_past) {
     auto start = std::chrono::high_resolution_clock::now();
 
-    // 1. Get or load block (includes file mmap, async residency touching and GPU host memory registration)
-    auto block = cache.get_or_load(atb_path);
-    if (!block) {
-        throw std::runtime_error("Failed to load block in benchmark");
+    auto res = cache.get_or_load(atb_path);
+    if (!res.has_value()) {
+        throw std::runtime_error("Failed to load block in benchmark: " + atb_path);
     }
-
-    // 2. Prefetch hint
+    std::shared_ptr<AeonToolBlock> block = res.value();
     cache.prefetch(atb_path);
-
-    // 3. Inject tool page (simulates true asynchronous DMA H2D + GPU-native RoPE shift)
-    const AeonToolBlockHeader* header = block->get_header();
-    uint32_t n_layer = header->n_layer;
-    uint32_t n_head_kv = header->n_head_kv;
-    uint32_t d_head = header->d_head;
-    uint32_t seq_len = header->seq_len;
-    uint32_t kv_size = 16384;
-    int32_t p = static_cast<int32_t>(n_past % kv_size);
-
-    std::span<const uint8_t> k_tensors_span = block->get_k_tensors();
-    const uint16_t* src_k_base = reinterpret_cast<const uint16_t*>(k_tensors_span.data());
-    size_t layer_elements = n_head_kv * seq_len * d_head;
-    int32_t delta_pos = static_cast<int32_t>(n_past) - static_cast<int32_t>(header->base_pos);
-
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        struct ggml_tensor * k_tensor = llama_kv_cache_get_k(ctx, il);
-        struct ggml_tensor * v_tensor = llama_kv_cache_get_v(ctx, il);
-        
-        const uint16_t* src_k_layer = src_k_base + il * layer_elements;
-        size_t k_size_row = n_head_kv * d_head * sizeof(uint16_t);
-
-        // Direct DMA copy parameters
-        llama_tensor_set_async(ctx, k_tensor, src_k_layer, p * k_size_row, seq_len * k_size_row);
-        llama_tensor_set_async(ctx, v_tensor, block->get_v_tensors().data() + il * layer_elements * 2, p * k_size_row, seq_len * k_size_row);
-    }
-
-    // Dispatch relative positional shift natively to GPU cores
-    llama_kv_cache_rope_shift_gpu(ctx, p, seq_len, delta_pos);
-
-    // Hard stream synchronization before stopping timer
+    NexusKVSplicer::inject_tool_page(ctx, block, n_past, 0);
     llama_backend_sync(ctx);
 
     auto end = std::chrono::high_resolution_clock::now();
-    
-    // Reset cache to keep subsequent runs clean
     llama_kv_cache_clear(ctx);
-    
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
@@ -193,8 +161,60 @@ void print_stats(const std::string& name, std::vector<double>& latencies) {
     double p90 = latencies[static_cast<size_t>(latencies.size() * 0.90)];
     double p99 = latencies[static_cast<size_t>(latencies.size() * 0.99)];
 
-    std::printf("%-30s | Average: %8.2f ms | P50: %8.2f ms | P90: %8.2f ms | P99: %8.2f ms\n",
+    std::printf("%-50s | Average: %8.2f ms | P50: %8.2f ms | P90: %8.2f ms | P99: %8.2f ms\n",
                 name.c_str(), avg, p50, p90, p99);
+}
+
+void print_stats_us(const std::string& name, std::vector<double>& latencies) {
+    std::sort(latencies.begin(), latencies.end());
+    double sum = std::accumulate(latencies.begin(), latencies.end(), 0.0);
+    double avg = sum / latencies.size();
+    double p50 = latencies[latencies.size() / 2];
+    double p90 = latencies[static_cast<size_t>(latencies.size() * 0.90)];
+    double p99 = latencies[static_cast<size_t>(latencies.size() * 0.99)];
+
+    std::printf("%-50s | Average: %8.2f µs | P50: %8.2f µs | P90: %8.2f µs | P99: %8.2f µs\n",
+                name.c_str(), avg, p50, p90, p99);
+}
+
+struct CliArgs {
+    std::string model_path;
+    std::string output_path = "results/bench_phase21_ttft.json";
+    std::string atb_path = "results/phaseA_tool_match_work/tool_0.isolated.atb";
+    int iterations = 100;
+    int warmup = 5;
+};
+
+CliArgs parse_args(int argc, char** argv) {
+    CliArgs args;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--model" && i + 1 < argc) {
+            args.model_path = argv[++i];
+        } else if (arg == "--atb" && i + 1 < argc) {
+            args.atb_path = argv[++i];
+        } else if (arg == "--output" && i + 1 < argc) {
+            args.output_path = argv[++i];
+        } else if (arg == "--iterations" && i + 1 < argc) {
+            args.iterations = std::stoi(argv[++i]);
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            args.warmup = std::stoi(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [--model <gguf>] [--output <json>] [--iterations N] [--warmup N]\n";
+            std::exit(0);
+        } else if (args.model_path.empty()) {
+            args.model_path = arg; // Backward-compatible positional model path.
+        } else {
+            throw std::runtime_error("Unknown argument: " + arg);
+        }
+    }
+    if (args.iterations <= 0) {
+        throw std::runtime_error("--iterations must be positive.");
+    }
+    if (args.warmup < 0) {
+        throw std::runtime_error("--warmup must be non-negative.");
+    }
+    return args;
 }
 
 int main(int argc, char** argv) {
@@ -204,10 +224,16 @@ int main(int argc, char** argv) {
 
     llama_backend_init();
 
-    std::string model_path = "";
-    if (argc > 1) {
-        model_path = argv[1];
-    } else {
+    CliArgs args;
+    try {
+        args = parse_args(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Argument error: " << e.what() << "\n";
+        return 1;
+    }
+
+    std::string model_path = args.model_path;
+    if (model_path.empty()) {
         std::printf("Resolving GGUF path via Ollama manifests...\n");
         model_path = resolve_ollama_model_via_script();
     }
@@ -280,63 +306,165 @@ int main(int argc, char** argv) {
 
     std::printf("Model Config: layers=%u, kv_heads=%u, head_dim=%u\n", n_layer, n_head_kv, d_head);
 
-    std::string atb_path = "bench_temp_tool.atb";
-    create_benchmark_atb_file(atb_path, schema_len, n_layer, n_head_kv, d_head);
+    std::string atb_path = args.atb_path;
+    if (!std::filesystem::exists(atb_path)) {
+        std::printf("Real ATB not found at %s; generating synthetic fallback.\n", atb_path.c_str());
+        atb_path = "bench_temp_tool.atb";
+        create_benchmark_atb_file(atb_path, schema_len, n_layer, n_head_kv, d_head);
+    }
+    const char* atb_payload_label = (args.atb_path == atb_path && atb_path != "bench_temp_tool.atb")
+        ? "real_compiled_kv"
+        : (std::filesystem::exists(args.atb_path) ? "real_compiled_kv" : "synthetic_fp16_0x3c00_dummy_kv");
+    if (std::filesystem::exists(args.atb_path)) {
+        atb_path = args.atb_path;
+        atb_payload_label = "real_compiled_kv";
+    }
 
     // Cache with 4GB pinned memory limit
     NexusBlockCache cache(4ULL * 1024 * 1024 * 1024);
 
+    // Initialize SLB
+    uint32_t n_embd = llama_n_embd(model);
+    uint32_t vocab_size = llama_n_vocab(model);
+    NexusSemanticSLB slb(n_embd);
+    // Register some dummy tools
+    for (uint32_t i = 0; i < 5; ++i) {
+        std::vector<float> dummy_vec(n_embd, 0.05f * (i + 1));
+        std::vector<int32_t> dummy_scent = {100 + static_cast<int32_t>(i), 101 + static_cast<int32_t>(i), 102 + static_cast<int32_t>(i), 103 + static_cast<int32_t>(i), 104 + static_cast<int32_t>(i)};
+        slb.register_tool(1000 + i, dummy_vec, dummy_scent);
+    }
+    
+    // Initialize FSM
+    NexusRadixFSM fsm;
+    std::vector<llama_token> fsm_route = { 101, 102, 103, 104, 105 };
+    fsm.add_route(1000, fsm_route);
+
     std::vector<double> prefill_latencies;
-    std::vector<double> nexus_latencies;
+    std::vector<double> slb_scan_latencies;
+    std::vector<double> fsm_routing_latencies;
+    std::vector<double> vram_splice_latencies;
+    std::vector<double> query_delta_latencies;
+    std::vector<double> true_nexus_ttfts;
 
     // Warmup runs
     std::printf("Executing warmup passes...\n");
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < args.warmup; ++i) {
         try {
             run_real_prefill_baseline(ctx, 12500);
             run_nexus_splicer_benchmark(cache, atb_path, ctx, 256);
+            run_real_prefill_baseline(ctx, 64);
+            std::vector<float> query_emb(n_embd, 0.1f);
+            slb.search(query_emb, 3);
+            fsm.reset(0);
+            fsm.begin_routing(0);
+            std::vector<float> logits(vocab_size, 0.0f);
+            fsm.apply_logit_mask(logits, 0);
+            fsm.advance(101, 0);
         } catch (const std::exception& e) {
             std::cerr << "Warmup error: " << e.what() << "\n";
         }
     }
 
     // Benchmark loop
-    const int iterations = 10;
-    std::printf("Running %d iterations...\n", iterations);
-    for (int i = 0; i < iterations; ++i) {
+    std::printf("Running %d iterations...\n", args.iterations);
+    for (int i = 0; i < args.iterations; ++i) {
         try {
+            // 1. Measure standard baseline (12.5k prefill)
             prefill_latencies.push_back(run_real_prefill_baseline(ctx, 12500));
-            nexus_latencies.push_back(run_nexus_splicer_benchmark(cache, atb_path, ctx, 256));
+
+            // 2. Measure SLB Scan
+            std::vector<float> query_emb(n_embd, 0.1f);
+            auto t0_slb = std::chrono::high_resolution_clock::now();
+            auto slb_res = slb.search(query_emb, 3);
+            auto t1_slb = std::chrono::high_resolution_clock::now();
+            double slb_us = std::chrono::duration<double, std::micro>(t1_slb - t0_slb).count();
+            slb_scan_latencies.push_back(slb_us);
+
+            // 3. Measure FSM Routing
+            fsm.reset(0);
+            fsm.begin_routing(0);
+            std::vector<float> logits(vocab_size, 0.0f);
+            auto t0_fsm = std::chrono::high_resolution_clock::now();
+            fsm.apply_logit_mask(logits, 0);
+            fsm.advance(101, 0);
+            auto t1_fsm = std::chrono::high_resolution_clock::now();
+            double fsm_us = std::chrono::duration<double, std::micro>(t1_fsm - t0_fsm).count();
+            fsm_routing_latencies.push_back(fsm_us);
+
+            // 4. Measure VRAM Splice
+            double splice_ms = run_nexus_splicer_benchmark(cache, atb_path, ctx, 256);
+            vram_splice_latencies.push_back(splice_ms);
+
+            // 5. Measure Query Delta Prefill
+            double delta_ms = run_real_prefill_baseline(ctx, 64);
+            query_delta_latencies.push_back(delta_ms);
+
+            // True Nexus TTFT = SLB + FSM + VRAM Splice + Query Delta
+            double true_ttft = (slb_us / 1000.0) + (fsm_us / 1000.0) + splice_ms + delta_ms;
+            true_nexus_ttfts.push_back(true_ttft);
         } catch (const std::exception& e) {
             std::cerr << "Iteration " << i << " error: " << e.what() << "\n";
         }
     }
 
-    if (!prefill_latencies.empty() && !nexus_latencies.empty()) {
-        print_stats("FlashAttention-2 GPU Prefill (12.5k)", prefill_latencies);
-        
-        std::string splice_label = "Nexus PCIe DMA + VRAM Splice";
-        if (is_metal) {
-            splice_label = "[Topology: UMA Zero-Copy] VRAM Splice Latency";
-        } else if (is_cuda) {
-            splice_label = "[Topology: NUMA/PCIe Gen4] Asynchronous H2D DMA Splice Latency";
-        }
-        print_stats(splice_label, nexus_latencies);
+    if (!prefill_latencies.empty() && !true_nexus_ttfts.empty()) {
+        std::printf("\n======================================================================\n");
+        std::printf("                   BENCHMARK COMPONENT PERFORMANCE                    \n");
+        std::printf("======================================================================\n");
+        print_stats("[FlashAttention-2 GPU Prefill] Baseline (12.5k)", prefill_latencies);
+        std::printf("----------------------------------------------------------------------\n");
+        print_stats_us("[L1 SLB Scan Latency] (SIMD dot-product)", slb_scan_latencies);
+        print_stats_us("[FSM Constrained Routing Latency] (Radix Trie)", fsm_routing_latencies);
+        print_stats("[VRAM Cache Splice Latency] (ATB Hot-Swap)", vram_splice_latencies);
+        print_stats("[Query Delta-Prefill Latency] (64-Token Tail)", query_delta_latencies);
+        std::printf("----------------------------------------------------------------------\n");
+        print_stats("[True Nexus TTFT] (Sum of the 4 above)", true_nexus_ttfts);
+        std::printf("----------------------------------------------------------------------\n");
 
         std::sort(prefill_latencies.begin(), prefill_latencies.end());
-        std::sort(nexus_latencies.begin(), nexus_latencies.end());
-        double speedup = prefill_latencies[prefill_latencies.size() / 2] / nexus_latencies[nexus_latencies.size() / 2];
-        std::printf("----------------------------------------------------------------------\n");
-        std::printf("Physical Speedup factor (P50): %.2f x\n", speedup);
+        std::sort(true_nexus_ttfts.begin(), true_nexus_ttfts.end());
+        double speedup = prefill_latencies[prefill_latencies.size() / 2] / true_nexus_ttfts[true_nexus_ttfts.size() / 2];
+        std::printf("True Empirical Speedup factor (P50): %.2f x\n", speedup);
         std::printf("======================================================================\n");
     } else {
         std::cerr << "Benchmark failed to collect latencies.\n";
+    }
+
+    try {
+        nexus::bench::write_artifact(
+            args.output_path,
+            "bench_phase21_ttft",
+            model_path,
+            {
+                {"model_path", model_path},
+                {"topology", topology_label},
+                {"iterations", std::to_string(args.iterations)},
+                {"warmup", std::to_string(args.warmup)},
+                {"schema_len_tokens", std::to_string(schema_len)},
+                {"baseline_prefill_tokens", "12500"},
+                {"query_delta_tokens", "64"},
+                {"atb_path", atb_path},
+                {"atb_payload", atb_payload_label}
+            },
+            {
+                {"baseline_prefill_ms", "ms", prefill_latencies},
+                {"slb_scan_us", "us", slb_scan_latencies},
+                {"fsm_routing_us", "us", fsm_routing_latencies},
+                {"vram_splice_ms", "ms", vram_splice_latencies},
+                {"query_delta_ms", "ms", query_delta_latencies},
+                {"true_nexus_ttft_ms", "ms", true_nexus_ttfts}
+            });
+        std::printf("Wrote JSON artifact: %s\n", args.output_path.c_str());
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to write benchmark artifact: " << e.what() << "\n";
     }
 
     // Clean up
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
-    std::filesystem::remove(atb_path);
+    if (atb_path == "bench_temp_tool.atb") {
+        std::filesystem::remove(atb_path);
+    }
     return 0;
 }

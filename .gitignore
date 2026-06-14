@@ -1,20 +1,31 @@
-# Build files
+# Weights and Binaries
+*.gguf
+*.atb
+*.bin
+*.safetensors
+*.pt
+results/tool_cross_encoder_finetuned*/
+
+# C++ Build & Python Caches
 build/
 bin/
 lib/
+__pycache__/
+*.pyc
+.venv/
+.cache/
+.pytest_cache/
 *.o
 *.a
 *.so
 *.dylib
 
-# Cache files
-.cache/
-.pytest_cache/
-__pycache__/
-*.pyc
-
-# IDE and OS files
+# Logs and local caches
+*.log
+*.npz
 .DS_Store
+
+# IDE
 .vscode/
 .idea/
 
@@ -26,5 +37,4 @@ test/schemas/bloat/
 test/schemas/bloat_embeddings.npz
 test/schemas/bloat_metadata.json
 test/schemas/test.db
-*.atb
-
+test/schemas/slb_manifest.json

@@ -1,7 +1,11 @@
 import sys
 import os
 import numpy as np
-import pytest
+try:
+    import pytest
+except ImportError:
+    pytest = None
+
 
 # Add the build directory to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))

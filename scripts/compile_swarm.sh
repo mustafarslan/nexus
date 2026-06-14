@@ -1,18 +1,16 @@
 #!/bin/bash
 set -e
 
-# Swarm Compiler for Phase 31 MCP Stress Test
+# Swarm Compiler for Phase 32 MCP Stress Test
 
 MODEL=""
 SCHEMA_DIR="test/schemas/bloat"
-FAST=false
 COUNT=10000
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --model) MODEL="$2"; shift ;;
         --schema) SCHEMA_DIR="$2"; shift ;;
-        --fast) FAST=true ;;
         --count) COUNT="$2"; shift ;;
         *) echo "Unknown parameter: $1"; exit 1 ;;
     esac
@@ -59,81 +57,37 @@ fi
 
 echo "Targeting compilation of $TOTAL_SCHEMAS schemas..."
 
-if [ "$FAST" = true ]; then
-    echo "[FAST MODE] Compiling 20 base schemas using C++ compiler, then fast-cloning..."
-    
-    # Compile exactly 1 base schema to ensure uniform block sizes (preventing allocator fragmentation)
-    NUM_BASES=1
-    if [ "$TOTAL_SCHEMAS" -lt "$NUM_BASES" ]; then
-        NUM_BASES=$TOTAL_SCHEMAS
+echo "Concurrently compiling $TOTAL_SCHEMAS schemas using $(sysctl -n hw.ncpu) threads..."
+
+# We write list of JSON files up to count in tool_id order
+LIST_FILE="build/schemas_to_compile.txt"
+rm -f "$LIST_FILE"
+python3 -c '
+import os, sys
+domains = ["aws_ec2", "jira", "github", "snowflake", "kubernetes", "slack", "stripe", "elastic", "postgres", "redis"]
+count = int(sys.argv[1])
+schema_dir = sys.argv[2]
+for tool_id in range(1, 10001):
+    domain = domains[tool_id % len(domains)]
+    tool_name = f"nexus_{domain}_api_{tool_id}"
+    json_path = os.path.join(schema_dir, f"{tool_name}.json")
+    if os.path.exists(json_path):
+        print(json_path)
+' "$TOTAL_SCHEMAS" "$SCHEMA_DIR" | head -n "$TOTAL_SCHEMAS" > "$LIST_FILE"
+
+
+cat "$LIST_FILE" | xargs -P $(sysctl -n hw.ncpu) -I {} bash -c '
+    json_file="$1"
+    atb_file="${json_file%.json}.atb"
+    if [ ! -f "$atb_file" ]; then
+        ./build/nexus_kv_compiler --model "'"$MODEL"'" --schema "$json_file" --output "$atb_file" > /dev/null 2>&1
     fi
-    
-    # Select the smallest JSON file in the directory to minimize block size and RAM usage
-    BASE_FILE=$(ls -S -r "$SCHEMA_DIR"/nexus_*.json | head -n 1)
-    BASE_FILES=("$BASE_FILE")
-    
-    echo "Compiling $NUM_BASES base schemas..."
-    for f in "${BASE_FILES[@]}"; do
-        atb="${f%.json}.atb"
-        if [ ! -f "$atb" ]; then
-            $COMPILER --model "$MODEL" --schema "$f" --output "$atb"
-        fi
-    done
-    
-    # Fast-clone the rest in Python
-    echo "Cloning compiled bases to remaining schemas..."
-    python3 -c '
-import os, shutil, sys
-schema_dir = sys.argv[1]
-count = int(sys.argv[2])
-base_files = sys.argv[3].split(",")
+' _ {}
 
-all_jsons = [f for f in os.listdir(schema_dir) if f.endswith(".json") and f.startswith("nexus_")]
-all_jsons.sort()
-all_jsons = all_jsons[:count]
+rm -f "$LIST_FILE"
 
-base_atbs = [f.replace(".json", ".atb") for f in base_files]
-
-for i, jf in enumerate(all_jsons):
-    target_atb = os.path.join(schema_dir, jf.replace(".json", ".atb"))
-    if os.path.exists(target_atb):
-        continue
-    # Pick a base ATB file round-robin
-    src_atb = base_atbs[i % len(base_atbs)]
-    try:
-        os.link(src_atb, target_atb)
-    except FileExistsError:
-        pass
-' "$SCHEMA_DIR" "$TOTAL_SCHEMAS" "$(IFS=,; echo "${BASE_FILES[*]}")"
-    
-    # Verify one sample ATB
-    echo "Verifying compiled sample..."
-    sample_atb="${BASE_FILES[0]%.json}.atb"
-    $VERIFIER "$sample_atb"
-    
-else
-    echo "[FULL MODE] Concurrently compiling $TOTAL_SCHEMAS schemas using $(sysctl -n hw.ncpu) threads..."
-    
-    # We write list of JSON files up to count
-    LIST_FILE="build/schemas_to_compile.txt"
-    rm -f "$LIST_FILE"
-    for ((i=0; i<TOTAL_SCHEMAS; i++)); do
-        echo "${ALL_JSONS[$i]}" >> "$LIST_FILE"
-    done
-    
-    cat "$LIST_FILE" | xargs -P $(sysctl -n hw.ncpu) -I {} bash -c '
-        json_file="$1"
-        atb_file="${json_file%.json}.atb"
-        if [ ! -f "$atb_file" ]; then
-            ./build/nexus_kv_compiler --model "'"$MODEL"'" --schema "$json_file" --output "$atb_file" > /dev/null 2>&1
-        fi
-    ' _ {}
-    
-    rm -f "$LIST_FILE"
-    
-    # Verify one sample ATB
-    sample_atb="${ALL_JSONS[0]%.json}.atb"
-    $VERIFIER "$sample_atb"
-fi
+# Verify one sample ATB
+sample_atb="${ALL_JSONS[0]%.json}.atb"
+$VERIFIER "$sample_atb"
 
 echo "Compilation swarm completed successfully!"

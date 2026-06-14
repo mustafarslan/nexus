@@ -13,14 +13,11 @@ using llama_token = int32_t;
 // seq_id must satisfy 0 <= seq_id < MAX_SEQUENCES.
 static constexpr size_t MAX_SEQUENCES = 1024;
 
-// Strictly aligned to prevent MOESI false sharing
-struct alignas(64) RadixNode {
-    bool is_leaf = false;
-    uint32_t tool_id = 0; // Maps to the .atb file index
-    
-    // For fast child lookups. std::vector is acceptable here because Trie 
-    // mutation happens offline/at init, NOT on the generation hot-path.
-    std::vector<std::pair<llama_token, std::unique_ptr<RadixNode>>> children; 
+struct RadixNode {
+    llama_token token = 0;
+    uint32_t first_child_idx = UINT32_MAX;
+    uint32_t next_sibling_idx = UINT32_MAX;
+    uint32_t tool_id = UINT32_MAX; // Use UINT32_MAX to denote non-leaf
 };
 
 enum class RoutingState {
@@ -37,7 +34,7 @@ enum class RoutingState {
 // The scratch_buffer is pre-allocated once (reserve(512)) and .clear()'d
 // on each hot-path call, guaranteeing ZERO heap allocations during generation.
 struct alignas(128) FSMState {
-    RadixNode* current_node = nullptr;
+    uint32_t current_node_idx = UINT32_MAX;
     RoutingState state = RoutingState::IDLE;
     uint32_t resolved_tool_id = 0;
     bool active = false; // Slot occupancy flag
@@ -49,7 +46,7 @@ struct alignas(128) FSMState {
 
 class NexusRadixFSM {
 private:
-    std::unique_ptr<RadixNode> root_;
+    std::vector<RadixNode> node_arena_;
 
     // Lock-free flat array. seq_id is a direct O(1) index.
     // Thread safety: each concurrent request operates on a disjoint seq_id.
@@ -72,6 +69,7 @@ public:
     // State management (lock-free, direct array index)
     void reset(llama_seq_id seq_id = 0);
     void begin_routing(llama_seq_id seq_id = 0); // Transitions from IDLE to NAVIGATING
+    void force_resolved(uint32_t tool_id, llama_seq_id seq_id = 0);
     RoutingState advance(llama_token sampled_token, llama_seq_id seq_id = 0);
     
     // The Zero-Copy Masking Hot-Path. LOCK-FREE.

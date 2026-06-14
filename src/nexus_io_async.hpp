@@ -23,8 +23,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
-#elif defined(_WIN32)
-#include <windows.h>
 #elif defined(__APPLE__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -56,9 +54,7 @@ struct AsyncIORequest {
     std::atomic<bool> has_error{false};
     std::atomic<int> error_code{0};
 
-#if defined(__linux__) || defined(__APPLE__)
     int fd = -1;
-#endif
 
 #if defined(__linux__)
     struct LinuxSubRequest {
@@ -66,14 +62,6 @@ struct AsyncIORequest {
         size_t expected_size = 0;
     };
     std::vector<std::unique_ptr<LinuxSubRequest>> sub_requests;
-#elif defined(_WIN32)
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    struct WinSubRequest {
-        OVERLAPPED overlapped{};
-        AsyncIORequest* parent = nullptr;
-        size_t expected_size = 0;
-    };
-    std::vector<std::unique_ptr<WinSubRequest>> sub_requests;
 #endif
 
     int result_res = 0;
@@ -186,12 +174,7 @@ inline struct io_uring& get_io_ring(int numa_node) {
 }
 #endif
 
-#if defined(_WIN32)
-inline HANDLE get_iocp_handle() {
-    static HANDLE hIocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    return hIocp;
-}
-#endif
+
 
 // Forward declaration of submit_async_read_direct
 void submit_async_read_direct(const std::string& filepath, void* buffer, size_t size, 
@@ -210,16 +193,12 @@ namespace nexus {
 namespace nexus {
 
 inline void process_io_completion(AsyncIORequest* req) {
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__)
     int res = req->result_res;
     bool success = req->result_success;
     if (!success) {
         int err = (res == 0) ? EIO : (res < 0 ? -res : res);
-#if defined(__linux__)
         req->promise.set_exception(std::make_exception_ptr(std::system_error(err, std::generic_category())));
-#elif defined(_WIN32)
-        req->promise.set_exception(std::make_exception_ptr(std::system_error(err, std::system_category())));
-#endif
         if (req->on_failure) req->on_failure();
     } else {
         try {
@@ -245,17 +224,10 @@ inline void process_io_completion(AsyncIORequest* req) {
             if (req->on_failure) req->on_failure();
         }
     }
-    #if defined(__linux__)
     if (req->fd >= 0) {
         close(req->fd);
     }
     req->sub_requests.clear();
-    #elif defined(_WIN32)
-    if (req->hFile != INVALID_HANDLE_VALUE) {
-        CloseHandle(req->hFile);
-    }
-    req->sub_requests.clear();
-    #endif
     delete req;
 
 #elif defined(__APPLE__)
@@ -331,66 +303,6 @@ inline void submit_async_read_direct(const std::string& filepath, void* buffer, 
 
     get_numa_mpsc_queues()[numa_node]->push(req);
 
-#elif defined(_WIN32)
-    std::wstring wpath(filepath.begin(), filepath.end());
-    HANDLE hFile = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        promise.set_exception(std::make_exception_ptr(std::system_error(GetLastError(), std::system_category())));
-        if (on_failure) on_failure();
-        return;
-    }
-
-    AsyncIORequest* req = new AsyncIORequest{
-        .filepath = filepath,
-        .buffer = buffer,
-        .size = size,
-        .promise = std::move(promise),
-        .block = block,
-        .on_failure = on_failure,
-        .hFile = hFile
-    };
-
-    CreateIoCompletionPort(hFile, get_iocp_handle(), reinterpret_cast<ULONG_PTR>(req), 0);
-
-    constexpr size_t MAX_IO_CHUNK_SIZE = 1024 * 1024 * 1024; // 1GB
-    size_t offset = 0;
-    while (offset < size) {
-        size_t chunk_size = std::min(size - offset, MAX_IO_CHUNK_SIZE);
-        auto sub = std::make_unique<AsyncIORequest::WinSubRequest>();
-        sub->parent = req;
-        sub->expected_size = chunk_size;
-        sub->overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
-        sub->overlapped.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFF);
-        
-        req->sub_requests.push_back(std::move(sub));
-        offset += chunk_size;
-    }
-    
-    req->chunks_remaining.store(static_cast<int>(req->sub_requests.size()), std::memory_order_relaxed);
-
-    for (size_t i = 0; i < req->sub_requests.size(); ++i) {
-        auto* sub = req->sub_requests[i].get();
-        size_t chunk_offset = (static_cast<size_t>(sub->overlapped.OffsetHigh) << 32) | sub->overlapped.Offset;
-        void* chunk_buf = static_cast<char*>(buffer) + chunk_offset;
-
-        DWORD bytesRead = 0;
-        if (ReadFile(hFile, chunk_buf, static_cast<DWORD>(sub->expected_size), &bytesRead, &sub->overlapped) == FALSE) {
-            DWORD err = GetLastError();
-            if (err != ERROR_IO_PENDING) {
-                req->has_error.store(true, std::memory_order_relaxed);
-                req->error_code.store(static_cast<int>(err), std::memory_order_relaxed);
-                int remaining = req->chunks_remaining.fetch_sub(1, std::memory_order_acq_rel);
-                if (remaining == 1) {
-                    CloseHandle(hFile);
-                    req->promise.set_exception(std::make_exception_ptr(std::system_error(err, std::system_category())));
-                    if (on_failure) on_failure();
-                    delete req;
-                    return;
-                }
-            }
-        }
-    }
-
 #elif defined(__APPLE__)
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd < 0) {
@@ -420,21 +332,20 @@ inline void submit_async_read_direct(const std::string& filepath, void* buffer, 
         .fd = fd
     };
 
-    auto completion_task = [](void* arg) {
-        AsyncIORequest* r = static_cast<AsyncIORequest*>(arg);
-        
+    #include <thread>
+    std::thread([req]() {
         constexpr size_t MAX_IO_CHUNK_SIZE = 1024 * 1024 * 1024; // 1GB
         size_t total_read = 0;
         bool has_err = false;
         int err_code = 0;
 
-        while (total_read < r->size) {
-            size_t chunk_size = std::min(r->size - total_read, MAX_IO_CHUNK_SIZE);
-            char* dest = static_cast<char*>(r->buffer) + total_read;
+        while (total_read < req->size) {
+            size_t chunk_size = std::min(req->size - total_read, MAX_IO_CHUNK_SIZE);
+            char* dest = static_cast<char*>(req->buffer) + total_read;
             
             size_t chunk_read = 0;
             while (chunk_read < chunk_size) {
-                ssize_t bytes_read = ::pread(r->fd, dest + chunk_read, chunk_size - chunk_read, total_read + chunk_read);
+                ssize_t bytes_read = ::pread(req->fd, dest + chunk_read, chunk_size - chunk_read, total_read + chunk_read);
                 if (bytes_read < 0) {
                     if (errno == EINTR) continue;
                     has_err = true;
@@ -451,12 +362,10 @@ inline void submit_async_read_direct(const std::string& filepath, void* buffer, 
             total_read += chunk_size;
         }
 
-        r->result_success = !has_err;
-        r->result_res = err_code;
-        process_io_completion(r);
-    };
-
-    get_numa_pool_manager().get_pool(0).submit(completion_task, req);
+        req->result_success = !has_err;
+        req->result_res = err_code;
+        process_io_completion(req);
+    }).detach();
 #endif
 }
 
@@ -542,10 +451,9 @@ inline void run_io_reactor(int numa_node, std::stop_token stop_tok) {
                 if (remaining == 1) {
                     req->result_success = !req->has_error.load(std::memory_order_relaxed);
                     req->result_res = req->error_code.load(std::memory_order_relaxed);
-                    auto task_func = [](void* arg) {
-                        process_io_completion(static_cast<AsyncIORequest*>(arg));
-                    };
-                    get_numa_pool_manager().get_pool(numa_node).submit(task_func, req);
+                    get_numa_pool_manager().get_pool(numa_node).submit([req]() {
+                        process_io_completion(req);
+                    });
                 }
             }
             count++;
@@ -555,38 +463,6 @@ inline void run_io_reactor(int numa_node, std::stop_token stop_tok) {
             io_uring_cq_advance(&ring, count);
         } else {
             std::this_thread::yield();
-        }
-    }
-
-#elif defined(_WIN32)
-    HANDLE hIocp = get_iocp_handle();
-    while (!stop_tok.stop_requested()) {
-        DWORD bytesTransferred = 0;
-        ULONG_PTR completionKey = 0;
-        LPOVERLAPPED pOverlapped = NULL;
-        BOOL success = GetQueuedCompletionStatus(hIocp, &bytesTransferred, &completionKey, &pOverlapped, 50);
-        if (pOverlapped) {
-            AsyncIORequest* req = reinterpret_cast<AsyncIORequest*>(completionKey);
-            if (req) {
-                AsyncIORequest::WinSubRequest* sub = reinterpret_cast<AsyncIORequest::WinSubRequest*>(pOverlapped);
-                if (!success) {
-                    req->has_error.store(true, std::memory_order_relaxed);
-                    req->error_code.store(static_cast<int>(GetLastError()), std::memory_order_relaxed);
-                } else if (bytesTransferred != sub->expected_size) {
-                    req->has_error.store(true, std::memory_order_relaxed);
-                    req->error_code.store(ERROR_HANDLE_EOF, std::memory_order_relaxed);
-                }
-                
-                int remaining = req->chunks_remaining.fetch_sub(1, std::memory_order_acq_rel);
-                if (remaining == 1) {
-                    req->result_success = !req->has_error.load(std::memory_order_relaxed);
-                    req->result_res = req->error_code.load(std::memory_order_relaxed);
-                    auto task_func = [](void* arg) {
-                        process_io_completion(static_cast<AsyncIORequest*>(arg));
-                    };
-                    get_numa_pool_manager().get_pool(numa_node).submit(task_func, req);
-                }
-            }
         }
     }
 

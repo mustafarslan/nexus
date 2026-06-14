@@ -2,13 +2,16 @@
 #include <string>
 #include <span>
 #include <cstdint>
+#include <cstddef>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <future>
 #include <atomic>
 #include <memory>
 #include <array>
 #include <vector>
+#include <expected>
 #include <functional>
 #include <random>
 #include <new>
@@ -44,6 +47,15 @@ struct StringViewHash {
 
 
 
+enum class NexusErrorCode : uint8_t;
+
+// Phase 58: Aligned shared control block for telemetry lifetimes
+struct alignas(NEXUS_CACHE_LINE) NexusTelemetry {
+    alignas(NEXUS_CACHE_LINE) std::atomic<uint64_t> load_errors{0};
+    alignas(NEXUS_CACHE_LINE) std::atomic<uint64_t> submit_rejections{0};
+    alignas(NEXUS_CACHE_LINE) std::atomic<uint64_t> blocks_freed{0};
+};
+
 class AeonToolBlock {
 private:
     void* mapped_data_ = nullptr;
@@ -54,10 +66,11 @@ private:
     uint64_t generation_id_ = 0;
     std::function<void(void*)> free_callback_;
     int numa_node_ = 0;
+    std::shared_ptr<NexusTelemetry> telemetry_;
 
 public:
     explicit AeonToolBlock(const std::string& atb_filepath, void* mapped_data, size_t file_size, 
-                           std::function<void(void*)> free_callback, std::function<void()> on_failure = nullptr, uint64_t generation_id = 0, int numa_node = 0);
+                           std::function<void(void*)> free_callback, std::function<void()> on_failure = nullptr, uint64_t generation_id = 0, int numa_node = 0, std::shared_ptr<NexusTelemetry> telemetry = nullptr);
     ~AeonToolBlock();
 
     AeonToolBlock(const AeonToolBlock&) = delete;
@@ -80,14 +93,32 @@ public:
     }
 };
 
-struct CacheEntry {
-    std::shared_future<std::shared_ptr<AeonToolBlock>> future;
+namespace nexus {
+    int get_thread_slot_index();
+}
+
+struct alignas(NEXUS_CACHE_LINE) CacheEntry {
+    // === HOT zone ===
+    std::atomic<bool> referenced{false}; // CLOCK style access flag
+    std::atomic<bool> evicted{false}; // Marked for eviction/removal
+
+    // === COLD zone (eviction-mutex-protected or immutable after init) ===
     std::atomic<uint64_t> last_access_tick{0};
     size_t byte_size{0};
     uint64_t generation_id{0};
-    size_t vector_index{0};
+    int numa_node{0}; // Phase 34: NUMA node this block was allocated on
+    bool is_protected{false}; // Scan-Resistant cache segment (false = Probation, true = Protected)
+
+    // Intrusive doubly-linked list pointers (eviction-mutex-protected)
+    CacheEntry* prev_lru = nullptr;
+    CacheEntry* next_lru = nullptr;
+
+    std::shared_future<std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode>> future;
     std::string filepath; // Retain filepath for cleanup & reference
-    std::atomic<uint32_t> active_readers{0};
+};
+
+struct alignas(128) HazardSlot {
+    std::atomic<CacheEntry*> entry{nullptr};
 };
 
 struct HazardGuard {
@@ -96,6 +127,8 @@ struct HazardGuard {
     HazardGuard() = default;
     explicit HazardGuard(CacheEntry* e);
     ~HazardGuard();
+
+    void release();
 
     // Disable copy
     HazardGuard(const HazardGuard&) = delete;
@@ -106,10 +139,30 @@ struct HazardGuard {
     HazardGuard& operator=(HazardGuard&& other) noexcept;
 };
 
+enum class NexusErrorCode : uint8_t {
+    OK = 0,
+    RESOURCE_EXHAUSTED = 1,
+    FILE_NOT_FOUND = 2,
+    INVALID_HEADER = 3,
+    INTERNAL_ERROR = 4,
+};
+
+class ResourceExhaustedException : public std::runtime_error {
+public:
+    explicit ResourceExhaustedException(const std::string& msg)
+        : std::runtime_error(msg) {}
+};
+
+// Phase 54: Lock-free telemetry counters for hot-path observability (no fprintf)
+struct NexusCacheTelemetry {
+    uint64_t load_errors;
+    uint64_t submit_rejections;
+    uint64_t blocks_freed;
+};
+
 struct alignas(NEXUS_CACHE_LINE) CacheShard {
     std::shared_mutex mutex;
     std::unordered_map<std::string, CacheEntry*, StringViewHash, std::equal_to<>> cache_map;
-    std::vector<CacheEntry*> keys;
 };
 
 class NexusBlockCache {
@@ -134,20 +187,76 @@ private:
     // Map tool_id to path for context manager lookups
     std::unordered_map<uint32_t, std::string> tool_id_to_path_;
     mutable std::shared_mutex tool_id_map_mutex_;
+    std::unordered_set<uint32_t> pinned_tool_ids_;
+    mutable std::shared_mutex pinned_mutex_;
 
-    void evict_to_limit(size_t required_bytes);
+    // Phase 34: Per-NUMA 2Q Intrusive Eviction Queues
+    // Each NUMA node gets its own probation/protected lists and mutex,
+    // preventing cross-socket UPI traffic during eviction and parallelizing
+    // cache misses across NUMA nodes.
+    struct alignas(NEXUS_CACHE_LINE) NUMAEvictionQueue {
+        std::mutex mtx;
+        CacheEntry* probation_head = nullptr;
+        CacheEntry* probation_tail = nullptr;
+        CacheEntry* protected_head = nullptr;
+        CacheEntry* protected_tail = nullptr;
+    };
+    std::unique_ptr<NUMAEvictionQueue[]> eviction_queues_;
+    size_t num_numa_nodes_ = 0;
+
+    std::shared_ptr<NexusTelemetry> telemetry_;
+
+    static void list_push_front(CacheEntry*& head, CacheEntry*& tail, CacheEntry* entry) {
+        entry->next_lru = head;
+        entry->prev_lru = nullptr;
+        if (head) {
+            head->prev_lru = entry;
+        } else {
+            tail = entry;
+        }
+        head = entry;
+    }
+
+    static void list_remove(CacheEntry*& head, CacheEntry*& tail, CacheEntry* entry) {
+        if (entry->prev_lru) {
+            entry->prev_lru->next_lru = entry->next_lru;
+        } else {
+            head = entry->next_lru;
+        }
+        if (entry->next_lru) {
+            entry->next_lru->prev_lru = entry->prev_lru;
+        } else {
+            tail = entry->prev_lru;
+        }
+        entry->prev_lru = nullptr;
+        entry->next_lru = nullptr;
+    }
+
+    std::mutex retired_mutex_;
+    std::vector<CacheEntry*> retired_entries_;
+
+    void retire_entry(CacheEntry* entry);
+    void reclaim_retired_entries();
+
+    void evict_to_limit(size_t required_bytes, int target_node);
+    bool is_path_pinned(const std::string& path) const;
     void initialize_numa_arena(int numa_node);
     CacheEntry* get_entry_from_ptr(void* mapped_data) const;
     int get_node_for_ptr(const void* ptr) const;
 
 public:
+    static constexpr size_t MAX_THREADS = 128;
+    static HazardSlot hazard_pointers[MAX_THREADS];
+
     explicit NexusBlockCache(size_t max_pinned_bytes);
     ~NexusBlockCache();
+
+    static void release_entry(CacheEntry* entry);
 
     NexusBlockCache(const NexusBlockCache&) = delete;
     NexusBlockCache& operator=(const NexusBlockCache&) = delete;
 
-    std::shared_ptr<AeonToolBlock> get_or_load(std::string_view atb_filepath);
+    std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode> get_or_load(std::string_view atb_filepath);
     void prefetch(std::string_view atb_filepath);
 
     // Dynamic failure handler callback interface for ABA mitigation
@@ -163,6 +272,13 @@ public:
     void release_hazard(void* mapped_data);
 
     void register_tool_path(uint32_t tool_id, const std::string& path);
+    void pin_tool(uint32_t tool_id);
+    void unpin_tool(uint32_t tool_id);
+    bool is_tool_pinned(uint32_t tool_id) const;
     HazardGuard hazard_guard(uint32_t tool_id);
+
+    NexusCacheTelemetry get_cache_telemetry() const;
 };
+
+// static_assert(offsetof(CacheEntry, active_readers) == 0, "Hot atomics must be at offset 0");
 

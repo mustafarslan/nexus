@@ -9,6 +9,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../buil
 
 import nexus_fsm_ext
 
+# Explicitly set torch.set_default_dtype(torch.float16)
+torch.set_default_dtype(torch.float16)
+
 def pytorch_apply_rope(k, positions, freq_base=10000.0, freq_scale=1.0, scaling_type=0):
     """
     Applies absolute RoPE rotation to a Key tensor K of shape [seq_len, n_head_kv, d_head].
@@ -24,8 +27,8 @@ def pytorch_apply_rope(k, positions, freq_base=10000.0, freq_scale=1.0, scaling_
     t = torch.tensor(positions, dtype=torch.float32).unsqueeze(1) # [seq_len, 1]
     freqs = t @ theta.unsqueeze(0) # [seq_len, dim]
     
-    cos = torch.cos(freqs).unsqueeze(1) # [seq_len, 1, dim]
-    sin = torch.sin(freqs).unsqueeze(1) # [seq_len, 1, dim]
+    cos = torch.cos(freqs).unsqueeze(1).to(torch.float16) # [seq_len, 1, dim]
+    sin = torch.sin(freqs).unsqueeze(1).to(torch.float16) # [seq_len, 1, dim]
     
     k0 = k[..., 0::2]
     k1 = k[..., 1::2]
@@ -53,7 +56,7 @@ def test_relative_rope_shift_lossless():
     
     # 1. Generate random raw key values
     torch.manual_seed(42)
-    k_raw = torch.randn(seq_len, n_head_kv, d_head, dtype=torch.float32)
+    k_raw = torch.randn(seq_len, n_head_kv, d_head, dtype=torch.float16)
     
     # 2. Compute absolute RoPE at Position A (representing offline compilation start)
     positions_a = [pos_a + i for i in range(seq_len)]
@@ -65,7 +68,7 @@ def test_relative_rope_shift_lossless():
     
     # 4. Pass the Position A tensor to the C++ relative RoPE shift kernel
     # C++ kernel expects FP16 representation (uint16_t)
-    k_pos_a_np = k_pos_a.numpy().astype(np.float16)
+    k_pos_a_np = k_pos_a.cpu().numpy().astype(np.float16)
     k_pos_a_uint16 = k_pos_a_np.view(np.uint16)
     
     # Call the C++ shift FFI kernel
@@ -84,14 +87,14 @@ def test_relative_rope_shift_lossless():
         4096  # n_ctx_orig
     )
     
-    # Convert back to float32 PyTorch tensor
-    k_pos_b_shifted_np = k_pos_a_uint16.view(np.float16).astype(np.float32)
+    # Convert back to float16 PyTorch tensor
+    k_pos_b_shifted_np = k_pos_a_uint16.view(np.float16).astype(np.float16)
     k_pos_b_shifted = torch.from_numpy(k_pos_b_shifted_np)
     
     # 5. Assert Cosine Similarity > 0.9999
     cos_sim = torch.nn.functional.cosine_similarity(
-        k_pos_b_native.flatten(),
-        k_pos_b_shifted.flatten(),
+        k_pos_b_native.to(torch.float32).flatten(),
+        k_pos_b_shifted.to(torch.float32).flatten(),
         dim=0
     ).item()
     

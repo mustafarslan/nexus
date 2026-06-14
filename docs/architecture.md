@@ -1,125 +1,156 @@
-# Project Nexus: Architecture Specification
+# Project Nexus v1.0: System Architecture
 
-This document defines the high-level system architecture, context lifecycles, memory models, and topological hardware constraints of Project Nexus.
+Nexus v1.0 is a **Hybrid C++23 Agentic Routing Engine and KV-Cache MMU** on llama.cpp. It pre-compiles MCP tool schemas into offline `.atb` KV blocks, routes tools via quantized retrieval and a radix trie FSM, and splices KV into the active context within strict physical boundaries.
+
+**Production headline:** Gateway TTFT P50 **171 ms**, E2E tool-hit **0.91** (n=100, Qwen2.5-14B-Instruct Q4_K_M, Darwin arm64). Source: [`results/bench_gateway_e2e_v2.json`](../results/bench_gateway_e2e_v2.json).
+
+**Honest speedup claim:** **2.8×** vs B3 retrieve-and-prefill baseline (N1 **466 ms** vs B3 **1.32 s**). The **153×** bloat strawman ratio is retired.
 
 ---
 
-## 1. High-Level System Architecture Blueprint
+## 1. Production Ship Path
 
-Nexus functions as a hardware-aware Memory Management Unit (MMU) for the LLM's context window. Instead of treating KV tensors as a flat, append-only buffer, Nexus partition-splicing decouples prompt-evaluation contexts to resolve schema prefill costs dynamically:
+```
+User Query
+  → Hybrid Dense Retrieval (INT8 SIMD, < 5 µs)
+  → Transient Intent Signatures (dense/CE document enrichment)
+  → P20 Adversarial Margin Gate → CE v3 Rerank (~20% fire rate)
+  → Context Depth Check (P ≤ 256?)
+      ├─ Path A: ATB KV Splice + 5% Suffix Recompute
+      └─ Path B: Exact-Token L0 Radix Copy / Text Prefill
+  → Trie FSM Logit-Masked Decode
+  → GBNF Argument Generation (Python)
+```
 
 ```mermaid
-graph TD
-    UserQuery[User Query & Embedding] --> SLBScan[1. L1 SLB SIMD Scan]
-    SLBScan --> GetCandidates[2. Extract Top-K Candidates & Scents]
-    GetCandidates --> PredictSpec[3. Speculative Candidate Selection]
-    
-    %% Speculative Branch
-    PredictSpec -->|Passes Threshold & Margin| SpecLoad[4a. Async Cache Load & Prefetch]
-    SpecLoad --> SpecSplice[4b. Speculative Async Splicing]
-    
-    %% Main Prefill Branch
-    PredictSpec -->|Fails Bounds| NoSpec[5. Skip Speculative Injection]
-    SpecSplice --> ScentPrefill[6. Scent + Query Prefill Decode]
-    NoSpec --> ScentPrefill
-    
-    ScentPrefill --> FSMRoute[7. Constrained Routing Loop via FSM]
-    FSMRoute --> Resolved{LEAF_REACHED?}
-    
-    %% Resolution Branch
-    Resolved -- Yes --> CheckSpec{Speculation Correct?}
-    CheckSpec -- Yes --> RecovSpec[8a. Invalidate FSM, Sync GPU DMA]
-    CheckSpec -- No --> FullSplice[8b. Evict Region, Load Correct Block & Splice]
-    
-    Resolved -- No --> GenerationAbort[Abort / Default Fallback]
-    
-    RecovSpec --> QueryReprefill[9. Downstream Query Delta-Prefill]
-    FullSplice --> QueryReprefill
-    QueryReprefill --> GenArgs[10. Generate Tool Arguments]
+flowchart TD
+    Query[UserQuery] --> Dense[HybridDenseRetrieval]
+    Dense --> Intent[IntentSignatures]
+    Intent --> MarginGate{P20MarginGate}
+    MarginGate -->|low margin| CE[CEv3Rerank]
+    MarginGate -->|high margin| DepthCheck
+    CE --> DepthCheck{n_past le 256?}
+    DepthCheck -->|yes| PathA["PathA: ATB splice + 5pct suffix"]
+    DepthCheck -->|no| PathB["PathB: L0 LCP radix or text prefill"]
+    PathA --> FSM[FSMLogitMask]
+    PathB --> FSM
+    FSM --> GBNF[GBNFArgs]
 ```
 
 ---
 
-## 2. The Two-Stage RoPE Context Lifecycle
+## 2. Dual-Path Physical Boundaries
 
-The Rotary Positional Embedding (RoPE) algorithm encodes absolute position indices directly into Key and Value tensors. Positional rotation values $\mathbf{R}_{\Theta, m}^d \mathbf{x}$ depend on the exact token coordinate $m$. Inserting a tool schema block at the beginning of the context shifts the coordinates of downstream tokens, invalidating their precomputed KV cache representations.
+| Path | Condition | Mechanism |
+|------|-----------|-----------|
+| **Path A (Fast)** | $P = n_{\text{past}} \le 256$ | POSIX-mapped `.atb` splice + 5% suffix recompute |
+| **Path B (Deep / Scale)** | $P > 256$ | Exact-token L0 radix warm copy or B3pc-style text prefill |
 
-To resolve this position-displacement constraint without full context recalculation, Nexus implements a **Two-Stage Context Lifecycle**:
+Enforcement: `max_splice_pos_` (default 256) in `NexusOrchestrator::route_and_splice`. When $P > 256$, splice returns `tool_id = 0` and Python `_prefix_cache_text_fallback` runs `decode_tokens` on the selected schema.
 
-```
-STAGE 1: The Routing Context (Prefill & Constrained Generation)
-+-------------------+--------------------+------------------------+
-| System Prompt     | Top-3 Scents       | User Query             |
-| [0 ... 255]       | [256 ... 270]      | [271 ... 271+Q-1]      |
-+-------------------+--------------------+------------------------+
-                  FSM Navigation starts at pos 256.
-                  Logit masking constrains vocabulary to valid trie paths.
+At $P = 256$, 5% suffix recompute: KL mean **0.0076** nats, top-1 agreement **1.00**.
 
-STAGE 2: The Execution Context (Page Fault & Splice)
-+-------------------+--------------------------------+------------------------+
-| System Prompt     | Spliced Tool Schema (ATB Cache) | User Query             |
-| [0 ... 255]       | [256 ... 256+S_len-1]          | [256+S_len ... +Q-1]   |
-+-------------------+--------------------------------+------------------------+
-                  Spliced block contains pre-computed, pre-rotated KV values.
-                  User Query is re-evaluated at position 256 + S_len.
-```
-
-### Stage 1: The Routing Phase
-1. **Hidden State Extraction**: The user query is tokenized, and the final token's float hidden state vector is evaluated to generate a semantic embedding.
-2. **SLB Scan**: The embedding is matched against the quantized L1 Semantic Lookaside Buffer to extract candidate tool "scents".
-3. **Scents Prefill**: The top 3 matching semantic scents (5-token fixed sequences representing schema boundaries) are prepended. The orchestrator decodes this combined segment starting at `base_pos` (default 256).
-4. **FSM Routing**: FSM logit masking restricts vocab options. Since scents are loaded in context, the model generates the target path deterministically.
-
-### Stage 2: The Execution Phase
-5. **Context Eviction**: Upon FSM leaf resolution (`LEAF_REACHED`), the orchestrator clears all sequence cache blocks downstream of `base_pos` (256) using `llama_kv_cache_seq_rm`.
-6. **KV Splicing**: The pre-compiled `.atb` file corresponding to the resolved tool ID is mapped. If it matches the speculative candidate already pre-spliced, Nexus simply flushes FSM tokens and synchronizes the GPU command queue. If it is a new candidate, Nexus performs a targeted 2D stride-aware memory blit into the active KV cache.
-7. **Query Delta-Prefill**: The user query is tokenized again and evaluated at position `256 + S_len`. Since the large tool schema ($S_{len}$ tokens) was spliced in, the query is prefilled downstream of it in a fraction of a millisecond.
-8. **Generation**: The LLM resumes argument extraction in the presence of the full schema context.
+At $P \ge 1024$, partial scattered recompute fails (KL up to **5.72**). See [`results/g4_gate_verdict.json`](../results/g4_gate_verdict.json).
 
 ---
 
-## 3. Physical Hardware Topologies: UMA vs. NUMA
+## 3. L0 Cache — Exact-Token LCP Radix Tree
 
-The physical performance of Project Nexus is governed by host/device topology limits.
+Path B uses `NexusRadixPrefixCache` ([`src/nexus_seq_warm_cache.hpp`](../src/nexus_seq_warm_cache.hpp)):
 
-```
-       APPLE SILICON (UMA)                      DISCRETE GPU SERVER (NUMA)
-+-----------------------------------+     +-----------------------------------+
-|       Unified Memory Pool         |     | Host RAM (Node 0)  Host RAM (Node 1)
-|     /                     \       |     |   [ mmap page ]      [ mmap page ]    
-| [CPU Cores] <----> [Metal GPU Cores]    |         \                 /       |
-|            (Zero-Copy)            |     |        [Interconnect (UPI/QPI)]   |
-+-----------------------------------+     |                 |                 |
-                                          |        [PCIe Gen4 Switch]         |
-                                          |                 |                 |
-                                          |           [Discrete GPU]          |
-                                          +-----------------------------------+
-```
+- **Zero-allocation exact-token longest common prefix (LCP) radix tree**
+- **Left-Child Right-Sibling (LCRS)** flat memory arena: `node_arena_` + `token_arena_`
+- 32 warm `llama_seq_id` pool slots (`POOL_BASE = 1`)
+- Hit path: walk token edges, match full edge strings, `llama_kv_cache_seq_cp` on best pool slot
+- **No FNV-1a chunking on the hit path** (purged in Phase 3 DOD refactor)
 
-### Apple Silicon Unified Memory Architecture (UMA)
-On macOS Apple Silicon chips (e.g., M4 Max), the CPU and GPU cores share the same physical silicon memory bus.
-* **DMA Fallacy**: The concept of "PCIe DMA transfers" does not exist on Apple Silicon. Tensors remain in unified memory.
-* **Fast-Blit Mechanics**: When memory mapping via POSIX `mmap`, pages exist in unified cache. `ggml_backend_tensor_set` triggers a memory block copy within physical RAM. The Metal driver uses zero-copy pointers, completing a 1.5GB schema swap in **$<0.05\text{ ms}$**.
+Validated: copy P50 **~3 µs**, hit rate **66%** — [`results/bench_phase28_radix_prefix_v2.json`](../results/bench_phase28_radix_prefix_v2.json).
 
-### Discrete GPU Clusters (NUMA Topology)
-On discrete GPU clusters running Linux (e.g., Intel/AMD dual-socket servers with NVIDIA H100 cards), system memory is split into Non-Uniform Memory Access (NUMA) nodes.
-* **The "First Touch" Trap**: The Linux OS allocates physical memory pages under a "First Touch" policy. When a file is mapped via `mmap`, physical pages are not allocated until they are touched. If the touch loop runs on a CPU core bound to NUMA Socket 0, but the GPU card is connected to PCIe lanes routed to NUMA Socket 1, every DMA transfer must traverse the slow CPU-to-CPU interconnect (UPI/QPI), halving the physical PCIe bandwidth.
-* **NUMA Interleaving Solution**: Nexus resolves this by executing aligned system calls (`SYS_mbind`) prior to page-touching, forcing page distribution across node boundaries (`MPOL_INTERLEAVE`). This ensures physical pages reside near the GPU's PCIe root complex, maximizing direct DMA transfer bandwidth.
+FNV-1a remains only for `.atb` `model_hash` (topology fingerprint) and block-cache filepath keys — not for L0 prefix matching.
 
 ---
 
-## 4. Multi-Tenant Scalability & Lock-Contention Mitigation
+## 4. ML Pipeline (M3)
 
-In enterprise scale environments hosting over 50,000+ cached tool schema blocks, standard memory managers crash into lock contention.
+### 4.1 Transient Intent Signatures
 
-### Probabilistic Eviction ($\mathcal{O}(1)$ Constant Complexity)
-* Linear sweeps through a massive hash map under a global write-lock violate Amdahl's Law, blocking concurrent serving threads.
-* Nexus utilizes a Redis-style probabilistic random eviction solver. Instead of scanning the entire map, it samples $K = 5$ random buckets from the hash map under the write-lock. It compares the atomic `last_access_tick` metadata of only these sampled elements and evicts the one with the lowest value. This bounds lock contention to sub-microsecond timescales.
+[`test/nexus_retrieval.py`](../test/nexus_retrieval.py): `_intent_signature_prefix()` prepends verb/action text via `enriched_tool_document_text()`. Applied to dense and CE documents only — **not** BM25 or generative routing prompts.
 
-### Asynchronous Page residency
-* OS page faults and memory pinning (`llama_register_host_memory`) are blocking IO operations. 
-* Nexus shifts this entire sequence to an asynchronous thread pool. The orchestrator issues non-blocking prefetch instructions. The background worker touches pages and registers memory, notifying the cache structure upon completion.
+### 4.2 P20 Dense Margin Gating
 
-### Dual-Layer Exception Safety & Recovery
-* If an IO error or memory allocation failure occurs in the background mapping thread, a naive system leaves the pending key in the cache map, which permanently poisons subsequent threads.
-* Nexus implements a structured callback registry. In the event of a loading exception, the background thread fires a callback that re-acquires the write-lock and erases the poisoned cache key. Waiting threads cleanly capture the exception from the `shared_future` and can retry, maintaining cache integrity.
+[`scripts/calibrate_margin_threshold.py`](../scripts/calibrate_margin_threshold.py) → [`src/nexus_calibration.py`](../src/nexus_calibration.py):
+
+| Constant | Value | Role |
+|----------|-------|------|
+| `CALIBRATED_MARGIN_THRESHOLD` | **0.01365** | Production routing threshold (P20 adversarial) |
+| `CALIBRATED_AMBIGUOUS_MARGIN` | **0.15** | Audit only — **not applied in routing** |
+
+~**20%** CE invocation rate. Audit trail: [`results/margin_calibration_p20.json`](../results/margin_calibration_p20.json).
+
+### 4.3 Synthetic-Only CE v3
+
+Default checkpoint: `results/tool_cross_encoder_finetuned_v3` (gitignored — train locally).
+
+```sh
+python3 scripts/train_cross_encoder.py --output results/tool_cross_encoder_finetuned_v3
+```
+
+Training data: synthetic paraphrases only ([`scripts/synthetic_ce_training_data.py`](../scripts/synthetic_ce_training_data.py)). Zero E2E leakage.
+
+M3 eval: dense Recall@1 **0.87**, CE Recall@1 **0.90** — [`results/recall_miss_analysis_v2.json`](../results/recall_miss_analysis_v2.json).
+
+---
+
+## 5. The Graveyard
+
+Purged approaches and why they failed:
+
+| Approach | Verdict | Root Cause |
+|----------|---------|------------|
+| **ColBERT MaxSim** | Disqualified | P50 **709 µs** vs <5 µs SLB budget; Recall@1 **0.72** — [`bench_phase22_maxsim.json`](../results/bench_phase22_maxsim.json) |
+| **LegoLink** (partial/scattered recompute) | FAIL | KL up to **5.72** at P=1024; full-chunk ~1.4 s research-only — [`g4_gate_verdict.json`](../results/g4_gate_verdict.json) |
+| **Blockmask Orchestrator** (N1m multi-tool) | FAIL | Tensor KL=0 but **e2e tool_accuracy 0.0** — causal isolation prevents cross-tool comparison — [`bench_n1m_fidelity_blockmask.json`](../results/bench_n1m_fidelity_blockmask.json) |
+| **FNV-1a 32-token chunking** | Purged | **0% L0 hit rate**, terminal-leaf mismatch, cache fragmentation; replaced by exact-token LCP radix |
+| **P>256 ATB splice** | Blocked | RoPE phase drift corrupts injected KV tensors; physics boundary enforced by orchestrator |
+
+---
+
+## 6. Empirical Results
+
+### 6.1 Gateway production (v1.0 headline)
+
+| Arm | Tool-hit | TTFT P50 |
+|-----|----------|----------|
+| `GW_route` | **0.91** | **171 ms** |
+
+Source: [`results/bench_gateway_e2e_v2.json`](../results/bench_gateway_e2e_v2.json)
+
+### 6.2 E2E baselines
+
+| Arm | Tool-hit | TTFT P50 | Role |
+|-----|----------|----------|------|
+| B1 | 0.98 | **9.48 s** | Strawman (retired) |
+| B3 | **0.91** | **1.33 s** | Honest baseline |
+| N1 | 0.85–0.86 | 466–482 ms | Fast splice path |
+| B3pc_hit | 0.91 | 331 ms | Prefix-cache warm tier |
+
+Source: [`results/bench_e2e_v2.json`](../results/bench_e2e_v2.json), [`results/bench_e2e.json`](../results/bench_e2e.json)
+
+### 6.3 TTFT decomposition
+
+Warm splice P50 **7.4 ms**; full bloat prefill **96.46 s** (microbench). Source: [`results/bench_phase21_ttft_real.json`](../results/bench_phase21_ttft_real.json).
+
+---
+
+## 7. Hardware Topology
+
+| Topology | Splice path | Notes |
+|----------|-------------|-------|
+| Apple Silicon UMA | Zero-copy mmap → Metal | Primary validation platform |
+| NUMA x86 | PCIe blit required | Stride-aware K/V copy in `NexusKvSplicer` |
+
+---
+
+## 8. Canonical Artifacts
+
+See [`results/README.md`](../results/README.md) for the v1.0 whitelist. Deep implementation detail: [`docs/internals.md`](internals.md).

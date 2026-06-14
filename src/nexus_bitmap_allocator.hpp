@@ -2,35 +2,24 @@
 
 #include <cstdint>
 #include <vector>
-#include <atomic>
 #include <stdexcept>
 #include <cstddef>
 #include <algorithm>
+#include <cassert>
+#include <mutex>
 #include <random>
 
 #ifndef NEXUS_PAGE_ALIGNMENT
 #define NEXUS_PAGE_ALIGNMENT (2 * 1024 * 1024) // 2MB HugeTLB alignment
 #endif
 
-namespace nexus {
-
-#if defined(_WIN32)
-#include <intrin.h>
-#pragma intrinsic(_BitScanForward64)
-inline int count_trailing_zeros_64(uint64_t mask) {
-    unsigned long index;
-    if (_BitScanForward64(&index, mask)) {
-        return static_cast<int>(index);
-    }
-    return 64;
-}
-#else
-inline int count_trailing_zeros_64(uint64_t mask) {
-    return __builtin_ctzll(mask);
-}
+#ifndef NEXUS_CACHE_LINE
+#define NEXUS_CACHE_LINE 128
 #endif
 
-// Xoshiro256++ PRNG implementation aligned to cache line
+namespace nexus {
+
+// Xoshiro256++ PRNG implementation aligned to cache line (used by block cache)
 class alignas(NEXUS_CACHE_LINE) Xoshiro256PlusPlus {
 private:
     uint64_t s[4];
@@ -72,21 +61,101 @@ inline uint64_t get_random_value() {
     return prng();
 }
 
+/**
+ * Power-of-2 Buddy Allocator operating on 2MB-aligned HugeTLB arenas.
+ *
+ * MEMORY SAFETY NOTE (Phase 34):
+ * The buddy calculation uses XOR on zero-based BLOCK INDICES, not on raw
+ * absolute pointers. Given block index `i` = (ptr - arena_base) / PAGE_SIZE,
+ * the buddy at order `k` is `i ^ (1 << k)`. Because `i` is a relative index
+ * starting from 0, the XOR is mathematically correct regardless of the OS
+ * mmap base address alignment. The arena base alignment only needs to satisfy
+ * the page size (2MB for HugeTLB), not the maximum block size.
+ *
+ * The constructor enforces that base_ptr is 2MB-aligned to prevent offset
+ * calculation errors from misaligned subtraction.
+ */
 class QuantizedBitmapAllocator {
 private:
+    struct BuddyNode {
+        size_t prev = -1;
+        size_t next = -1;
+        bool free = false;
+        size_t order = 0;
+    };
+
     void* base_ptr_;
     size_t total_size_;
-    std::vector<std::atomic<uint64_t>> bitset_;
+    size_t num_blocks_;
+    size_t max_order_;
+    std::vector<BuddyNode> nodes_;
+    std::vector<size_t> free_heads_;
+    std::mutex mutex_;
+
+    void push_to_free_list(size_t i, size_t order) {
+        nodes_[i].free = true;
+        nodes_[i].order = order;
+        nodes_[i].next = free_heads_[order];
+        nodes_[i].prev = -1;
+        if (free_heads_[order] != -1) {
+            nodes_[free_heads_[order]].prev = i;
+        }
+        free_heads_[order] = i;
+    }
+
+    void remove_from_free_list(size_t i, size_t order) {
+        size_t prev_idx = nodes_[i].prev;
+        size_t next_idx = nodes_[i].next;
+        if (prev_idx != -1) {
+            nodes_[prev_idx].next = next_idx;
+        } else {
+            free_heads_[order] = next_idx;
+        }
+        if (next_idx != -1) {
+            nodes_[next_idx].prev = prev_idx;
+        }
+        nodes_[i].free = false;
+        nodes_[i].next = -1;
+        nodes_[i].prev = -1;
+    }
 
 public:
     QuantizedBitmapAllocator(void* base_ptr, size_t total_size)
-        : base_ptr_(base_ptr), total_size_(total_size),
-          bitset_(((total_size / NEXUS_PAGE_ALIGNMENT) + 63) / 64) {
+        : base_ptr_(base_ptr), total_size_(total_size) {
+        // Phase 34: Validate arena base is page-aligned to prevent offset math errors
+        if (reinterpret_cast<uintptr_t>(base_ptr) % NEXUS_PAGE_ALIGNMENT != 0) {
+            throw std::invalid_argument(
+                "Arena base must be aligned to NEXUS_PAGE_ALIGNMENT (2MB). "
+                "Got address: " + std::to_string(reinterpret_cast<uintptr_t>(base_ptr)));
+        }
         if (total_size % NEXUS_PAGE_ALIGNMENT != 0) {
             throw std::invalid_argument("Total size must be a multiple of 2MB");
         }
-        for (size_t i = 0; i < bitset_.size(); ++i) {
-            bitset_[i].store(0ULL, std::memory_order_relaxed);
+        num_blocks_ = total_size / NEXUS_PAGE_ALIGNMENT;
+        if (num_blocks_ == 0) {
+            throw std::invalid_argument("Total size must be at least 2MB");
+        }
+
+        max_order_ = 0;
+        while ((1ULL << max_order_) < num_blocks_) {
+            max_order_++;
+        }
+
+        nodes_.resize(num_blocks_);
+        free_heads_.assign(max_order_ + 1, -1);
+
+        // Binary decomposition of the range [0, num_blocks_ - 1] into buddy-aligned blocks
+        size_t curr = 0;
+        while (curr < num_blocks_) {
+            size_t remaining = num_blocks_ - curr;
+            size_t block_size = 1;
+            size_t order = 0;
+            while (block_size * 2 <= remaining && (curr % (block_size * 2) == 0)) {
+                block_size *= 2;
+                order++;
+            }
+            push_to_free_list(curr, order);
+            curr += block_size;
         }
     }
 
@@ -94,119 +163,80 @@ public:
     QuantizedBitmapAllocator& operator=(const QuantizedBitmapAllocator&) = delete;
 
     void* allocate(size_t size) {
-        size_t blocks_needed = (size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
-        size_t num_blocks = total_size_ / NEXUS_PAGE_ALIGNMENT;
-        size_t num_words = bitset_.size();
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t needed_blocks = (size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
+        if (needed_blocks == 0) return nullptr;
 
-        thread_local size_t next_search_index = get_random_value() % num_words;
-        size_t start_word = next_search_index;
-
-        for (size_t step = 0; step < num_words; ++step) {
-            size_t w = (start_word + step) % num_words;
-            uint64_t val = bitset_[w].load(std::memory_order_relaxed);
-            if (val == ~0ULL) {
-                continue;
-            }
-            int bit = count_trailing_zeros_64(~val);
-            size_t i = w * 64 + bit;
-            if (i + blocks_needed > num_blocks) {
-                continue;
-            }
-
-            // Check if the contiguous range starting at i is free
-            bool range_free = true;
-            size_t j = 0;
-            for (; j < blocks_needed; ++j) {
-                size_t check_word = (i + j) / 64;
-                size_t check_bit = (i + j) % 64;
-                uint64_t cv = bitset_[check_word].load(std::memory_order_relaxed);
-                if (cv & (1ULL << check_bit)) {
-                    range_free = false;
-                    break;
-                }
-            }
-
-            if (!range_free) {
-                // Skip to the next possible starting point
-                size_t next_pos = i + j + 1;
-                size_t next_w = next_pos / 64;
-                if (next_w > w) {
-                    step += (next_w - w - 1);
-                }
-                continue;
-            }
-
-            // Try to reserve all blocks in the contiguous range using CAS-with-rollback
-            bool success = true;
-            size_t reserved_count = 0;
-            for (size_t k = 0; k < blocks_needed; ++k) {
-                size_t check_word = (i + k) / 64;
-                size_t check_bit = (i + k) % 64;
-                uint64_t mask = 1ULL << check_bit;
-
-                uint64_t expected = bitset_[check_word].load(std::memory_order_relaxed);
-                while (true) {
-                    if (expected & mask) {
-                        // Conflict: block already reserved by another thread
-                        success = false;
-                        break;
-                    }
-                    if (bitset_[check_word].compare_exchange_weak(expected, expected | mask, 
-                                                                  std::memory_order_acquire, 
-                                                                  std::memory_order_relaxed)) {
-                        reserved_count++;
-                        break;
-                    }
-                }
-                if (!success) {
-                    break;
-                }
-            }
-
-            if (success) {
-                next_search_index = (i + blocks_needed) / 64 % num_words;
-                return static_cast<char*>(base_ptr_) + (i * NEXUS_PAGE_ALIGNMENT);
-            }
-
-            // Rollback already reserved blocks on failure
-            for (size_t k = 0; k < reserved_count; ++k) {
-                size_t check_word = (i + k) / 64;
-                size_t check_bit = (i + k) % 64;
-                uint64_t mask = 1ULL << check_bit;
-                uint64_t expected = bitset_[check_word].load(std::memory_order_relaxed);
-                while (true) {
-                    uint64_t desired = expected & ~mask;
-                    if (bitset_[check_word].compare_exchange_weak(expected, desired, 
-                                                                  std::memory_order_release, 
-                                                                  std::memory_order_relaxed)) {
-                        break;
-                    }
-                }
-            }
+        size_t order = 0;
+        while ((1ULL << order) < needed_blocks) {
+            order++;
         }
-        return nullptr;
+
+        if (order > max_order_) return nullptr;
+
+        size_t found_order = order;
+        while (found_order <= max_order_ && free_heads_[found_order] == -1) {
+            found_order++;
+        }
+
+        if (found_order > max_order_) {
+            return nullptr; // No block available
+        }
+
+        size_t i = free_heads_[found_order];
+        remove_from_free_list(i, found_order);
+
+        while (found_order > order) {
+            found_order--;
+            size_t buddy = i + (1ULL << found_order);
+            push_to_free_list(buddy, found_order);
+        }
+
+        nodes_[i].order = order;
+        nodes_[i].free = false;
+        return static_cast<char*>(base_ptr_) + i * NEXUS_PAGE_ALIGNMENT;
     }
 
     void free(void* ptr, size_t size) {
         if (!ptr) return;
+        std::lock_guard<std::mutex> lock(mutex_);
         size_t offset = static_cast<char*>(ptr) - static_cast<char*>(base_ptr_);
-        size_t start_idx = offset / NEXUS_PAGE_ALIGNMENT;
-        size_t blocks_needed = (size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
+        size_t i = offset / NEXUS_PAGE_ALIGNMENT;
+        size_t needed_blocks = (size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
 
-        for (size_t j = 0; j < blocks_needed; ++j) {
-            size_t word_idx = (start_idx + j) / 64;
-            size_t bit_idx = (start_idx + j) % 64;
-            uint64_t mask = 1ULL << bit_idx;
-            uint64_t expected = bitset_[word_idx].load(std::memory_order_relaxed);
-            while (true) {
-                uint64_t desired = expected & ~mask;
-                if (bitset_[word_idx].compare_exchange_weak(expected, desired, 
-                                                             std::memory_order_release, 
-                                                             std::memory_order_relaxed)) {
-                    break;
-                }
+        size_t order = 0;
+        while ((1ULL << order) < needed_blocks) {
+            order++;
+        }
+
+        while (order < max_order_) {
+            // XOR on block index `i` (not raw pointer) to find buddy.
+            // This is safe because `i` is a zero-based index: i = offset / PAGE_SIZE.
+            size_t buddy = i ^ (1ULL << order);
+            // Bounds guard: for non-power-of-2 arena sizes, XOR can exceed num_blocks_
+            assert(buddy != i && "XOR buddy equals self — logic error in order tracking");
+            if (buddy >= num_blocks_ || !nodes_[buddy].free || nodes_[buddy].order != order) {
+                break;
+            }
+            remove_from_free_list(buddy, order);
+            i = std::min(i, buddy);
+            order++;
+        }
+
+        push_to_free_list(i, order);
+    }
+
+    size_t get_free_bytes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t free_blocks = 0;
+        for (size_t order = 0; order <= max_order_; ++order) {
+            size_t curr = free_heads_[order];
+            while (curr != -1) {
+                free_blocks += (1ULL << order);
+                curr = nodes_[curr].next;
             }
         }
+        return free_blocks * NEXUS_PAGE_ALIGNMENT;
     }
 };
 

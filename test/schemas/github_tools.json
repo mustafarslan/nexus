@@ -5,7 +5,7 @@
     {
       "name": "create_or_update_file",
       "title": null,
-      "description": "Create or update a single file in a GitHub repository",
+      "description": "Create or update a single file's content in an existing GitHub repository (write/modify code, config, or text files). Do NOT use for creating repositories, issues, pull requests, or branches — use create_repository, create_issue, create_pull_request, or create_branch instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -58,7 +58,7 @@
     {
       "name": "search_repositories",
       "title": null,
-      "description": "Search for GitHub repositories",
+      "description": "Search and discover GitHub repositories by keyword or query. Do NOT use for reading file contents, pushing files, or modifying repository files.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -90,7 +90,7 @@
     {
       "name": "create_repository",
       "title": null,
-      "description": "Create a new GitHub repository in your account",
+      "description": "Create a brand-new empty GitHub repository in your account. Do NOT use for adding/updating files inside an existing repo (use create_or_update_file) or for opening issues.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -126,7 +126,7 @@
     {
       "name": "get_file_contents",
       "title": null,
-      "description": "Get the contents of a file or directory from a GitHub repository",
+      "description": "Read and retrieve the contents of an existing file or directory from a GitHub repository. Do NOT use for writing, updating, or pushing files — use create_or_update_file or push_files instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -164,7 +164,7 @@
     {
       "name": "push_files",
       "title": null,
-      "description": "Push multiple files to a GitHub repository in a single commit",
+      "description": "Push multiple files to a GitHub repository in a single commit (batch upload). Do NOT use for creating issues, searching repos, or listing commit history — use create_issue, search_repositories, or list_commits instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -224,7 +224,7 @@
     {
       "name": "create_issue",
       "title": null,
-      "description": "Create a new issue in a GitHub repository",
+      "description": "Create a new GitHub issue (bug report, feature request, task) in a repository. Do NOT use for modifying or creating code files — use create_or_update_file instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -273,7 +273,7 @@
     {
       "name": "create_pull_request",
       "title": null,
-      "description": "Create a new pull request in a GitHub repository",
+      "description": "Create a new pull request to merge changes between branches in a GitHub repository. Do NOT use for creating a standalone branch without a PR — use create_branch instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -362,7 +362,7 @@
     {
       "name": "create_branch",
       "title": null,
-      "description": "Create a new branch in a GitHub repository",
+      "description": "Create a new git branch in an existing GitHub repository. Do NOT use for opening a pull request — use create_pull_request when the intent is to merge changes.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -400,7 +400,7 @@
     {
       "name": "list_commits",
       "title": null,
-      "description": "Get list of commits of a branch in a GitHub repository",
+      "description": "List commit history for a branch in a GitHub repository. Do NOT use for uploading or pushing new files — use push_files or create_or_update_file instead.",
       "inputSchema": {
         "type": "object",
         "properties": {

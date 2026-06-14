@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 project(nexus VERSION 0.1.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -42,6 +42,7 @@ else()
 endif()
 
 # Add llama.cpp as a subdirectory (already checked out at pinned tag b3400)
+set(LLAMA_BUILD_EXAMPLES ON CACHE BOOL "Build llama.cpp examples (llama-bench)" FORCE)
 add_subdirectory(external/llama.cpp)
 
 # Target for the Offline KV Compiler CLI
@@ -94,6 +95,7 @@ nanobind_add_module(nexus_fsm_ext
     src/nexus_orchestrator.cpp
     src/nexus_rope_math.cpp
     src/nexus_block_cache.cpp
+    src/nexus_seq_warm_cache.cpp
 )
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
@@ -129,6 +131,8 @@ if (benchmark_FOUND)
         src/nexus_block_cache.cpp
         src/nexus_rope_math.cpp
         src/nexus_kv_splicer.cpp
+        src/nexus_slb.cpp
+        src/nexus_fsm.cpp
     )
     target_compile_features(bench_phase21_ttft PRIVATE cxx_std_23)
     target_include_directories(bench_phase21_ttft PRIVATE
@@ -153,6 +157,8 @@ else()
         src/nexus_block_cache.cpp
         src/nexus_rope_math.cpp
         src/nexus_kv_splicer.cpp
+        src/nexus_slb.cpp
+        src/nexus_fsm.cpp
     )
     target_compile_features(bench_phase21_ttft PRIVATE cxx_std_23)
     target_include_directories(bench_phase21_ttft PRIVATE
@@ -168,4 +174,44 @@ else()
     if(APPLE)
         target_link_libraries(bench_phase21_ttft PRIVATE "-framework Metal" "-framework Foundation")
     endif()
+endif()
+
+# Target for concurrent hazard benchmark
+add_executable(bench_phase22_concurrent_hazard
+    test/bench_phase22_concurrent_hazard.cpp
+    src/nexus_os_compat.cpp
+    src/nexus_block_cache.cpp
+    src/nexus_rope_math.cpp
+    src/nexus_kv_splicer.cpp
+    src/nexus_slb.cpp
+    src/nexus_fsm.cpp
+)
+target_compile_features(bench_phase22_concurrent_hazard PRIVATE cxx_std_23)
+target_include_directories(bench_phase22_concurrent_hazard PRIVATE
+    src/
+    external/llama.cpp/include/
+    external/llama.cpp/src/
+    external/llama.cpp/ggml/include/
+)
+target_link_libraries(bench_phase22_concurrent_hazard PRIVATE
+    llama
+    ggml
+)
+if(APPLE)
+    target_link_libraries(bench_phase22_concurrent_hazard PRIVATE "-framework Metal" "-framework Foundation")
+endif()
+
+add_executable(bench_phase28_radix_prefix
+    test/bench_phase28_radix_prefix.cpp
+    src/nexus_seq_warm_cache.cpp
+)
+target_compile_features(bench_phase28_radix_prefix PRIVATE cxx_std_23)
+target_include_directories(bench_phase28_radix_prefix PRIVATE
+    src/
+    external/llama.cpp/include/
+    external/llama.cpp/ggml/include/
+)
+target_link_libraries(bench_phase28_radix_prefix PRIVATE llama)
+if(APPLE)
+    target_link_libraries(bench_phase28_radix_prefix PRIVATE "-framework Metal" "-framework Foundation")
 endif()

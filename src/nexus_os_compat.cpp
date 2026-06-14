@@ -5,235 +5,6 @@
 #include <string>
 #include <sstream>
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <memoryapi.h>
-#include <processtopologyapi.h>
-#include <io.h>
-
-// Dynamic MapViewOfFileNuma2 signature
-typedef PVOID (WINAPI *PFN_MapViewOfFileNuma2)(
-    HANDLE hFileMappingObject,
-    HANDLE hProcess,
-    ULONG64 SectionOffset,
-    PVOID BaseAddress,
-    SIZE_T ViewSize,
-    ULONG AllocationType,
-    ULONG PageProtection,
-    ULONG PreferredNode
-);
-
-static bool enable_lock_memory_privilege() {
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        return false;
-    }
-    LUID luid;
-    if (!LookupPrivilegeValueW(NULL, L"SeLockMemoryPrivilege", &luid)) {
-        CloseHandle(hToken);
-        return false;
-    }
-    TOKEN_PRIVILEGES tp;
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    
-    BOOL res = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
-    DWORD err = GetLastError();
-    CloseHandle(hToken);
-    return res && (err == ERROR_SUCCESS);
-}
-
-class WindowsMemoryManager : public INexusMemoryManager {
-private:
-    bool large_pages_enabled_ = false;
-    size_t large_page_size_ = 0;
-
-public:
-    WindowsMemoryManager() {
-        large_pages_enabled_ = enable_lock_memory_privilege();
-        large_page_size_ = GetLargePageMinimum();
-    }
-
-    void* map_file(int fd, size_t size, int numa_node) override {
-        if (fd < 0 || size == 0) return nullptr;
-        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
-        if (hFile == INVALID_HANDLE_VALUE) return nullptr;
-
-        void* addr = nullptr;
-        
-        // Try with large pages if enabled and size is compatible
-        if (large_pages_enabled_ && large_page_size_ > 0 && (size % large_page_size_ == 0)) {
-            HANDLE hMapping = CreateFileMappingW(
-                hFile,
-                NULL,
-                PAGE_READONLY | 0x80000000 /* SEC_LARGE_PAGES */,
-                0,
-                0,
-                NULL
-            );
-            if (hMapping) {
-                HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-                PFN_MapViewOfFileNuma2 pfnMapViewOfFileNuma2 = nullptr;
-                if (hKernel32) {
-                    pfnMapViewOfFileNuma2 = (PFN_MapViewOfFileNuma2)GetProcAddress(hKernel32, "MapViewOfFileNuma2");
-                }
-
-                if (pfnMapViewOfFileNuma2) {
-                    addr = pfnMapViewOfFileNuma2(
-                        hMapping,
-                        GetCurrentProcess(),
-                        0,
-                        nullptr,
-                        size,
-                        0,
-                        PAGE_READONLY,
-                        static_cast<ULONG>(numa_node)
-                    );
-                } else {
-                    addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, size);
-                }
-                CloseHandle(hMapping);
-            }
-        }
-
-        // Fallback to standard page size mapping
-        if (!addr) {
-            HANDLE hMapping = CreateFileMappingW(
-                hFile,
-                NULL,
-                PAGE_READONLY,
-                0,
-                0,
-                NULL
-            );
-            if (hMapping) {
-                HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-                PFN_MapViewOfFileNuma2 pfnMapViewOfFileNuma2 = nullptr;
-                if (hKernel32) {
-                    pfnMapViewOfFileNuma2 = (PFN_MapViewOfFileNuma2)GetProcAddress(hKernel32, "MapViewOfFileNuma2");
-                }
-
-                if (pfnMapViewOfFileNuma2) {
-                    addr = pfnMapViewOfFileNuma2(
-                        hMapping,
-                        GetCurrentProcess(),
-                        0,
-                        nullptr,
-                        size,
-                        0,
-                        PAGE_READONLY,
-                        static_cast<ULONG>(numa_node)
-                    );
-                } else {
-                    addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, size);
-                }
-                CloseHandle(hMapping);
-            }
-        }
-
-        return addr;
-    }
-
-    void unmap_file(void* addr, size_t size) override {
-        if (!addr) return;
-        (void)size;
-        UnmapViewOfFile(addr);
-    }
-
-    void prefetch(void* addr, size_t size) override {
-        if (!addr || size == 0) return;
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            typedef BOOL (WINAPI *PFN_PrefetchVirtualMemory)(
-                HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG
-            );
-            PFN_PrefetchVirtualMemory pfnPrefetch = 
-                (PFN_PrefetchVirtualMemory)GetProcAddress(hKernel32, "PrefetchVirtualMemory");
-            if (pfnPrefetch) {
-                WIN32_MEMORY_RANGE_ENTRY entry;
-                entry.VirtualAddress = addr;
-                entry.NumberOfBytes = size;
-                pfnPrefetch(GetCurrentProcess(), 1, &entry, 0);
-            }
-        }
-    }
-
-    void* allocate_numa(size_t size, int numa_node) override {
-        if (size == 0) return nullptr;
-        
-        if (large_pages_enabled_ && large_page_size_ > 0) {
-            size_t aligned_size = ((size + large_page_size_ - 1) / large_page_size_) * large_page_size_;
-            void* addr = VirtualAllocExNuma(
-                GetCurrentProcess(),
-                nullptr,
-                aligned_size,
-                MEM_RESERVE | MEM_COMMIT | 0x20000000 /* MEM_LARGE_PAGES */,
-                PAGE_READWRITE,
-                numa_node
-            );
-            if (addr) return addr;
-        }
-
-        return VirtualAllocExNuma(
-            GetCurrentProcess(),
-            nullptr,
-            size,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE,
-            numa_node
-        );
-    }
-
-    void free_numa(void* addr, size_t size) override {
-        if (!addr) return;
-        (void)size;
-        VirtualFree(addr, 0, MEM_RELEASE);
-    }
-
-    void* allocate_huge_arena(size_t size, int numa_node) override {
-        if (size == 0) return nullptr;
-        size_t aligned_size = ((size + 2097151) / 2097152) * 2097152;
-        void* addr = nullptr;
-        if (large_pages_enabled_ && large_page_size_ > 0) {
-            size_t lp_aligned_size = ((size + large_page_size_ - 1) / large_page_size_) * large_page_size_;
-            addr = VirtualAllocExNuma(
-                GetCurrentProcess(),
-                nullptr,
-                lp_aligned_size,
-                MEM_RESERVE | MEM_COMMIT | 0x20000000 /* MEM_LARGE_PAGES */,
-                PAGE_READWRITE,
-                numa_node
-            );
-        }
-        if (!addr) {
-            addr = VirtualAllocExNuma(
-                GetCurrentProcess(),
-                nullptr,
-                aligned_size,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-                numa_node
-            );
-        }
-        return addr;
-    }
-
-    void free_huge_arena(void* addr, size_t size) override {
-        if (!addr) return;
-        (void)size;
-        VirtualFree(addr, 0, MEM_RELEASE);
-    }
-};
-
-#else
-
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -295,8 +66,14 @@ public:
     
     void prefetch(void* addr, size_t size) override {
         if (!addr || size == 0) return;
-        #if defined(__linux__) || defined(__APPLE__)
-        posix_madvise(addr, size, POSIX_MADV_WILLNEED);
+        #if defined(__linux__)
+            #if defined(MADV_POPULATE_READ)
+                madvise(addr, size, MADV_POPULATE_READ);
+            #else
+                posix_madvise(addr, size, POSIX_MADV_WILLNEED);
+            #endif
+        #elif defined(__APPLE__)
+            posix_madvise(addr, size, POSIX_MADV_WILLNEED);
         #endif
     }
     
@@ -326,22 +103,46 @@ public:
 
     void* allocate_huge_arena(size_t size, int numa_node) override {
         if (size == 0) return nullptr;
-        size_t aligned_size = ((size + 2097151) / 2097152) * 2097152;
+        size_t page_size = 2097152; // 2MB
+        size_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
+        
         void* addr = MAP_FAILED;
 #if defined(__linux__) && defined(MAP_HUGETLB)
         addr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (addr != MAP_FAILED) {
+#if defined(SYS_mbind)
+            if (numa_node >= 0) {
+                unsigned long nodemask = (1UL << numa_node);
+                syscall(SYS_mbind, addr, aligned_size, 1 /* MPOL_BIND */, &nodemask, sizeof(nodemask) * 8, 0);
+            }
 #endif
-        if (addr == MAP_FAILED) {
-            addr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            return addr;
         }
+#endif
+        size_t alloc_size = aligned_size + page_size;
+        addr = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (addr == MAP_FAILED) return nullptr;
+        
+        uintptr_t raw_addr = reinterpret_cast<uintptr_t>(addr);
+        uintptr_t aligned_addr = ((raw_addr + page_size - 1) / page_size) * page_size;
+        void* final_addr = reinterpret_cast<void*>(aligned_addr);
+        
+        if (aligned_addr > raw_addr) {
+            munmap(addr, aligned_addr - raw_addr);
+        }
+        size_t prefix_len = aligned_addr - raw_addr;
+        size_t suffix_len = page_size - prefix_len;
+        if (suffix_len > 0) {
+            munmap(reinterpret_cast<void*>(aligned_addr + aligned_size), suffix_len);
+        }
+        
 #if defined(__linux__) && defined(SYS_mbind)
         if (numa_node >= 0) {
             unsigned long nodemask = (1UL << numa_node);
-            syscall(SYS_mbind, addr, aligned_size, 1 /* MPOL_BIND */, &nodemask, sizeof(nodemask) * 8, 0);
+            syscall(SYS_mbind, final_addr, aligned_size, 1 /* MPOL_BIND */, &nodemask, sizeof(nodemask) * 8, 0);
         }
 #endif
-        return addr;
+        return final_addr;
     }
 
     void free_huge_arena(void* addr, size_t size) override {
@@ -350,15 +151,10 @@ public:
         munmap(addr, aligned_size);
     }
 };
-#endif
 
 std::shared_ptr<INexusMemoryManager> get_memory_manager() {
     static std::shared_ptr<INexusMemoryManager> manager = []() -> std::shared_ptr<INexusMemoryManager> {
-#if defined(_WIN32)
-        return std::make_shared<WindowsMemoryManager>();
-#else
         return std::make_shared<PosixMemoryManager>();
-#endif
     }();
     return manager;
 }
@@ -393,12 +189,6 @@ int discover_gpu_numa_node() {
         }
     } catch (...) {}
     return 0;
-#elif defined(_WIN32)
-    ULONG highest_node = 0;
-    if (GetNumaHighestNodeNumber(&highest_node) && highest_node > 0) {
-        return 0;
-    }
-    return 0;
 #else
     return 0;
 #endif
@@ -424,11 +214,6 @@ int get_numa_node_count() {
             count = max_node + 1;
         }
     } catch (...) {}
-#elif defined(_WIN32)
-    ULONG highest_node = 0;
-    if (GetNumaHighestNodeNumber(&highest_node)) {
-        count = static_cast<int>(highest_node) + 1;
-    }
 #endif
     return count > 0 ? count : 1;
 }
@@ -454,15 +239,6 @@ std::vector<int> get_numa_node_cores(int numa_node) {
                         physical_cores.push_back(c);
                     }
                 }
-            }
-        }
-    }
-#elif defined(_WIN32)
-    GROUP_AFFINITY groupAffinity;
-    if (GetNumaNodeProcessorMaskEx(static_cast<USHORT>(numa_node), &groupAffinity)) {
-        for (int i = 0; i < 64; ++i) {
-            if (groupAffinity.Mask & (1ULL << i)) {
-                physical_cores.push_back(i);
             }
         }
     }
@@ -506,9 +282,7 @@ std::vector<int> get_numa_node_cores(int numa_node) {
 }
 
 void pin_thread_to_core(std::thread::native_handle_type handle, int core_id) {
-#if defined(_WIN32)
-    SetThreadAffinityMask(handle, 1ULL << core_id);
-#elif defined(__linux__)
+#if defined(__linux__)
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core_id, &cpuset);
@@ -526,54 +300,6 @@ void pin_thread_to_core(std::thread::native_handle_type handle, int core_id) {
 }
 
 bool read_file_direct(const std::string& filepath, void* dest_addr, size_t size) {
-#if defined(_WIN32)
-    std::wstring wpath(filepath.begin(), filepath.end());
-    HANDLE hFile = CreateFileW(
-        wpath.c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_NO_BUFFERING,
-        NULL
-    );
-    if (hFile == INVALID_HANDLE_VALUE) {
-        // Fallback to normal buffering
-        hFile = CreateFileW(
-            wpath.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            NULL,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL
-        );
-        if (hFile == INVALID_HANDLE_VALUE) return false;
-    }
-    
-    DWORD bytesRead = 0;
-    size_t total_read = 0;
-    char* ptr = static_cast<char*>(dest_addr);
-    bool success = true;
-    while (total_read < size) {
-        DWORD chunk = static_cast<DWORD>(std::min<size_t>(1024ULL * 1024 * 1024, size - total_read));
-        OVERLAPPED overlapped = {};
-        overlapped.Offset = static_cast<DWORD>(total_read & 0xFFFFFFFF);
-        overlapped.OffsetHigh = static_cast<DWORD>((total_read >> 32) & 0xFFFFFFFF);
-        
-        if (!ReadFile(hFile, ptr + total_read, chunk, &bytesRead, &overlapped)) {
-            DWORD err = GetLastError();
-            if (err != ERROR_IO_PENDING && err != ERROR_SUCCESS) {
-                success = false;
-                break;
-            }
-        }
-        total_read += bytesRead;
-        if (bytesRead == 0) break; // EOF
-    }
-    CloseHandle(hFile);
-    return success && (total_read == size);
-#else
     int flags = O_RDONLY;
 #if defined(__linux__)
     flags |= O_DIRECT;
@@ -601,7 +327,6 @@ bool read_file_direct(const std::string& filepath, void* dest_addr, size_t size)
     }
     close(fd);
     return success && (total_read == size);
-#endif
 }
 
 // Legacy wrappers
@@ -618,14 +343,8 @@ void prefetch_memory(void* addr, size_t size) {
 }
 
 size_t get_page_size() {
-#if defined(_WIN32)
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    return sysInfo.dwPageSize;
-#else
     long page_size = sysconf(_SC_PAGESIZE);
     return page_size > 0 ? static_cast<size_t>(page_size) : 4096;
-#endif
 }
 
 void apply_numa_hint(void* addr, size_t size) {

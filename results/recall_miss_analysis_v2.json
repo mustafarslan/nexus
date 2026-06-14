@@ -1,0 +1,13 @@
+{
+  "n_queries": 100,
+  "recall_at_1": 0.87,
+  "recall_at_5": 0.99,
+  "ce_recall_at_1": 0.9,
+  "ce_rerank_fraction": 0.2,
+  "margin_threshold": 0.013646852970123292,
+  "n_misses": 13,
+  "misses": [],
+  "target_recall_at_1": 0.9,
+  "meets_target": true,
+  "honest_ceiling_note": "M3: P20 adversarial calibration; 0.15 clamp audit-only; CE v3 synthetic-only training."
+}

@@ -5,19 +5,9 @@
 #include <iostream>
 #include <thread>
 
-#if defined(_WIN32)
-#include <io.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#define open _open
-#define fstat _fstat
-#define close _close
-#define stat _stat
-#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 NexusPageMounter::NexusPageMounter(const std::string& atb_filepath) {
     fd_ = open(atb_filepath.c_str(), O_RDONLY);

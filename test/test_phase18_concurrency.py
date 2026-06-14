@@ -4,6 +4,7 @@ import struct
 import tempfile
 import concurrent.futures
 import pytest
+import time
 
 # Add build directory to python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
@@ -57,13 +58,27 @@ def test_lru_cache_concurrency():
     cache = NexusBlockCache(2)
 
     def hammer_cache(file_path):
-        # 1. Load block
-        block = cache.get_or_load(file_path)
+        # 1. Load block (retry on ResourceExhaustedError)
+        block = None
+        for _ in range(500):
+            try:
+                block = cache.get_or_load(file_path)
+                break
+            except (RuntimeError, nexus_fsm_ext.ResourceExhaustedError) as e:
+                if isinstance(e, nexus_fsm_ext.ResourceExhaustedError) or "NEXUS_RESOURCE_EXHAUSTED" in str(e) or "Capacity Fully Saturated" in str(e):
+                    time.sleep(0.001)
+                    continue
+                raise
+        
         assert block is not None
         assert block.get_file_size() > 0
         
         # 2. Asynchronously prefetch
-        cache.prefetch(file_path)
+        try:
+            cache.prefetch(file_path)
+        except (RuntimeError, nexus_fsm_ext.ResourceExhaustedError) as e:
+            if not (isinstance(e, nexus_fsm_ext.ResourceExhaustedError) or "NEXUS_RESOURCE_EXHAUSTED" in str(e) or "Capacity Fully Saturated" in str(e)):
+                raise
         
         # 3. Retrieve some stats
         seq_len = block.seq_len

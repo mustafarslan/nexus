@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "benchmark": "phase22_maxsim",
+  "git_sha": "1384a33be3e6efc5f330e5b762060d6b4afe1ded",
+  "hardware": "Darwin 25.5.0 arm64",
+  "timestamp": "2026-06-14T10:57:15Z",
+  "config": {
+    "n_tools": 52,
+    "note": "ColBERT MaxSim disqualified from production L1"
+  },
+  "metrics": {
+    "latency_us": {
+      "unit": "us",
+      "raw_samples": [
+        709.0
+      ],
+      "summary": {
+        "p50": 709.0,
+        "n": 1
+      }
+    },
+    "recall_at_1": {
+      "unit": "ratio",
+      "raw_samples": [
+        0.72
+      ],
+      "summary": {
+        "p50": 0.72,
+        "n": 1
+      }
+    }
+  },
+  "verdict": {
+    "production_eligible": false,
+    "reason": "latency_budget_and_recall"
+  }
+}

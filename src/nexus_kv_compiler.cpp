@@ -33,14 +33,22 @@ struct CliArgs {
     std::string schema_path;
     std::string output_path;
     std::string static_anchor_path;
+    std::string batch_list_path;
     bool verbose = false;
     int32_t threads = -1;
+    uint32_t base_pos = 0;
+    uint32_t pos_bucket = 0;
+    bool sink_prefix = false;
 };
 
 void print_usage(const char * argv0) {
     std::cerr << "Usage: " << argv0 << " --model <model_path> --schema <schema_path> --output <output_path> [options]\n"
               << "Options:\n"
+              << "  --batch-list <path>  One 'schema_path,output_path' per line (single model load)\n"
               << "  --static-anchor <path>  Path to static anchor text file (optional)\n"
+              << "  --base-pos <int>   Prefill filler tokens before schema at this position (default: 0)\n"
+              << "  --pos-bucket <int> Snap compile base to positional bucket (256/1024/4096)\n"
+              << "  --sink-prefix      Prepend attention-sink system prefix before schema\n"
               << "  --threads <int>    Number of threads for decode (default: auto)\n"
               << "  --verbose          Enable verbose logging\n"
               << "  --help             Show this help message\n";
@@ -61,6 +69,17 @@ bool parse_args(int argc, char ** argv, CliArgs & args) {
         } else if (arg == "--static-anchor") {
             if (i + 1 < argc) args.static_anchor_path = argv[++i];
             else return false;
+        } else if (arg == "--batch-list") {
+            if (i + 1 < argc) args.batch_list_path = argv[++i];
+            else return false;
+        } else if (arg == "--base-pos") {
+            if (i + 1 < argc) args.base_pos = static_cast<uint32_t>(std::stoul(argv[++i]));
+            else return false;
+        } else if (arg == "--pos-bucket") {
+            if (i + 1 < argc) args.pos_bucket = static_cast<uint32_t>(std::stoul(argv[++i]));
+            else return false;
+        } else if (arg == "--sink-prefix") {
+            args.sink_prefix = true;
         } else if (arg == "--threads") {
             if (i + 1 < argc) args.threads = std::stoi(argv[++i]);
             else return false;
@@ -74,7 +93,8 @@ bool parse_args(int argc, char ** argv, CliArgs & args) {
             return false;
         }
     }
-    return !args.model_path.empty() && !args.schema_path.empty() && !args.output_path.empty();
+    return !args.model_path.empty()
+        && ((!args.schema_path.empty() && !args.output_path.empty()) || !args.batch_list_path.empty());
 }
 
 std::string read_file(const std::string & path) {
@@ -149,7 +169,29 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Load and tokenize static anchor if provided
+    std::vector<std::pair<std::string, std::string>> jobs;
+    if (!args.batch_list_path.empty()) {
+        std::ifstream batch_in(args.batch_list_path);
+        if (!batch_in.is_open()) {
+            std::cerr << "Error: Could not open batch list: " << args.batch_list_path << "\n";
+            llama_free_model(model);
+            llama_backend_free();
+            return 1;
+        }
+        std::string line;
+        while (std::getline(batch_in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            auto comma = line.find(',');
+            if (comma == std::string::npos) continue;
+            jobs.emplace_back(line.substr(0, comma), line.substr(comma + 1));
+        }
+        std::cout << "Batch mode: " << jobs.size() << " schemas (single model load)\n";
+    } else {
+        jobs.emplace_back(args.schema_path, args.output_path);
+    }
+
+    int exit_code = 0;
+
     std::vector<llama_token> system_tokens;
     if (!args.static_anchor_path.empty()) {
         std::string system_text = read_file(args.static_anchor_path);
@@ -169,10 +211,35 @@ int main(int argc, char ** argv) {
         if (args.verbose) {
             std::cout << "Tokenized static anchor: " << n_sys_tokens << " tokens.\n";
         }
+    } else if (args.sink_prefix) {
+        const std::string sink_text = "You are a helpful assistant.\n\n";
+        system_tokens.resize(sink_text.size() + 4);
+        int32_t n_sys_tokens = llama_tokenize(model, sink_text.c_str(), sink_text.size(), system_tokens.data(), system_tokens.size(), false, false);
+        if (n_sys_tokens < 0) {
+            system_tokens.resize(-n_sys_tokens);
+            n_sys_tokens = llama_tokenize(model, sink_text.c_str(), sink_text.size(), system_tokens.data(), system_tokens.size(), false, false);
+        }
+        if (n_sys_tokens < 0) {
+            std::cerr << "Error: Failed to tokenize sink prefix text.\n";
+            llama_free_model(model);
+            llama_backend_free();
+            return 1;
+        }
+        system_tokens.resize(n_sys_tokens);
+        if (args.verbose) {
+            std::cout << "Tokenized sink prefix: " << n_sys_tokens << " tokens.\n";
+        }
     }
 
+    for (size_t job_idx = 0; job_idx < jobs.size(); ++job_idx) {
+        const std::string & schema_path = jobs[job_idx].first;
+        const std::string & output_path = jobs[job_idx].second;
+        if (args.verbose) {
+            std::cout << "Job " << (job_idx + 1) << "/" << jobs.size() << ": " << schema_path << "\n";
+        }
+
     // Load and tokenize the MCP tool JSON schema
-    std::string schema_text = read_file(args.schema_path);
+    std::string schema_text = read_file(schema_path);
     std::vector<llama_token> schema_tokens(schema_text.size() + 4);
     int32_t n_schema_tokens = llama_tokenize(model, schema_text.c_str(), schema_text.size(), schema_tokens.data(), schema_tokens.size(), false, false);
     if (n_schema_tokens < 0) {
@@ -181,9 +248,8 @@ int main(int argc, char ** argv) {
     }
     if (n_schema_tokens < 0) {
         std::cerr << "Error: Failed to tokenize schema text.\n";
-        llama_free_model(model);
-        llama_backend_free();
-        return 1;
+        exit_code = 1;
+        break;
     }
     schema_tokens.resize(n_schema_tokens);
 
@@ -193,7 +259,11 @@ int main(int argc, char ** argv) {
 
     uint32_t system_prefix_length = system_tokens.size();
     uint32_t n_tokens = schema_tokens.size();
-    uint32_t total_tokens = system_prefix_length + n_tokens;
+    uint32_t compile_base = args.base_pos;
+    if (args.pos_bucket > 0) {
+        compile_base = (args.base_pos / args.pos_bucket) * args.pos_bucket;
+    }
+    uint32_t total_tokens = compile_base + system_prefix_length + n_tokens;
 
     // Configure context parameters
     llama_context_params ctx_params = llama_context_default_params();
@@ -220,23 +290,37 @@ int main(int argc, char ** argv) {
     // Run the prefill decoding starting at pos = 0
     llama_batch batch = llama_batch_init(total_tokens, 0, 1);
     batch.n_tokens = total_tokens;
-    for (uint32_t i = 0; i < system_prefix_length; ++i) {
-        batch.token[i] = system_tokens[i];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 0;
+    uint32_t pos = 0;
+    if (compile_base > 0) {
+        for (uint32_t i = 0; i < compile_base; ++i) {
+            batch.token[i] = 1;
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 0;
+        }
+        pos = compile_base;
     }
+    for (uint32_t i = 0; i < system_prefix_length; ++i) {
+        batch.token[pos + i] = system_tokens[i];
+        batch.pos[pos + i] = pos + i;
+        batch.n_seq_id[pos + i] = 1;
+        batch.seq_id[pos + i][0] = 0;
+        batch.logits[pos + i] = 0;
+    }
+    pos += system_prefix_length;
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        batch.token[system_prefix_length + i] = schema_tokens[i];
-        batch.pos[system_prefix_length + i] = system_prefix_length + i;
-        batch.n_seq_id[system_prefix_length + i] = 1;
-        batch.seq_id[system_prefix_length + i][0] = 0;
-        batch.logits[system_prefix_length + i] = (i == n_tokens - 1) ? 1 : 0;
+        batch.token[pos + i] = schema_tokens[i];
+        batch.pos[pos + i] = pos + i;
+        batch.n_seq_id[pos + i] = 1;
+        batch.seq_id[pos + i][0] = 0;
+        batch.logits[pos + i] = (i == n_tokens - 1) ? 1 : 0;
     }
 
     if (args.verbose) {
-        std::cout << "Prefilling system prefix + schema tokens starting at base_pos=0...\n";
+        std::cout << "Prefilling with compile_base=" << compile_base
+                  << " system_prefix=" << system_prefix_length
+                  << " schema_tokens=" << n_tokens << "...\n";
     }
     int decode_res = llama_decode(ctx, batch);
     llama_batch_free(batch);
@@ -286,7 +370,8 @@ int main(int argc, char ** argv) {
     header.n_head_kv = n_head_kv;
     header.d_head = d_head;
     header.seq_len = n_tokens;
-    header.base_pos = system_prefix_length;
+    uint32_t schema_start = compile_base + system_prefix_length;
+    header.base_pos = schema_start;
     header.rope_freq_base = llama_model_rope_freq_base(model);
     header.rope_freq_scale = llama_model_rope_freq_scale(model);
     header.rope_scaling_type = llama_model_rope_scaling_type(model);
@@ -326,7 +411,7 @@ int main(int argc, char ** argv) {
         // Extract and pack K [n_tokens, n_head_kv, d_head]
         {
             size_t k_slice_elements = n_head_kv * d_head * n_tokens;
-            size_t src_element_offset = system_prefix_length * n_head_kv * d_head;
+            size_t src_element_offset = schema_start * n_head_kv * d_head;
             size_t layer_offset = il * layer_elements;
 
             ggml_backend_tensor_get(k_tensor, k_packed.data() + layer_offset, src_element_offset * 2, k_slice_elements * 2);
@@ -338,7 +423,7 @@ int main(int argc, char ** argv) {
             if (!v_trans) {
                 // Un-transposed layout: [n_tokens, n_head_kv, d_head]
                 size_t v_slice_elements = n_head_kv * d_head * n_tokens;
-                size_t src_element_offset = system_prefix_length * n_head_kv * d_head;
+                size_t src_element_offset = schema_start * n_head_kv * d_head;
 
                 ggml_backend_tensor_get(v_tensor, v_packed.data() + layer_offset, src_element_offset * 2, v_slice_elements * 2);
             } else {
@@ -364,16 +449,15 @@ int main(int argc, char ** argv) {
     }
 
     if (args.verbose) {
-        std::cout << "Writing AeonToolBlock to " << args.output_path << "...\n";
+        std::cout << "Writing AeonToolBlock to " << output_path << "...\n";
     }
 
-    std::ofstream out(args.output_path, std::ios::binary);
+    std::ofstream out(output_path, std::ios::binary);
     if (!out.is_open()) {
-        std::cerr << "Error: Failed to open output file: " << args.output_path << "\n";
+        std::cerr << "Error: Failed to open output file: " << output_path << "\n";
         llama_free(ctx);
-        llama_free_model(model);
-        llama_backend_free();
-        return 1;
+        exit_code = 1;
+        break;
     }
 
     // Write aligned header
@@ -405,13 +489,11 @@ int main(int argc, char ** argv) {
     }
     out.close();
 
-    std::cout << "Serialization complete.\n"
-              << "AeonToolBlock written successfully to " << args.output_path << "\n";
-
-    // Clean up
+    std::cout << "AeonToolBlock written successfully to " << output_path << "\n";
     llama_free(ctx);
+    } // end batch jobs loop
+
     llama_free_model(model);
     llama_backend_free();
-
-    return 0;
+    return exit_code;
 }

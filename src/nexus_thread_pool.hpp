@@ -3,11 +3,140 @@
 #include <vector>
 #include <thread>
 #include <cstddef>
+#include <cstdlib>
+#include <type_traits>
+#include <new>
 #include "nexus_os_compat.hpp"
 
 namespace nexus {
     void poll_completions();
     void run_io_reactor(int numa_node, std::stop_token stop_tok);
+
+    template <typename Signature>
+    class InlineTask;
+
+    template <typename ReturnType, typename... Args>
+    class alignas(64) InlineTask<ReturnType(Args...)> {
+    private:
+        // ── VTable Trampoline (Phase 64.2) ──────────────────────────────────
+        struct VTable {
+            ReturnType (*invoke)(void*, Args...);
+            void (*move)(void*, void*) noexcept;
+            void (*destroy)(void*) noexcept;
+        };
+
+        // ── Per-type static constexpr VTable instances (Phase 64.4) ─────────
+        template <typename F>
+        static constexpr VTable vtable_for = {
+            // invoke
+            [](void* obj, Args... args) -> ReturnType {
+                if constexpr (std::is_void_v<ReturnType>) {
+                    (*std::launder(reinterpret_cast<F*>(obj)))(std::forward<Args>(args)...);
+                } else {
+                    return (*std::launder(reinterpret_cast<F*>(obj)))(std::forward<Args>(args)...);
+                }
+            },
+            // move
+            [](void* src, void* dst) noexcept {
+                ::new (dst) F(std::move(*std::launder(reinterpret_cast<F*>(src))));
+            },
+            // destroy
+            [](void* obj) noexcept {
+                std::launder(reinterpret_cast<F*>(obj))->~F();
+            }
+        };
+
+        // ── Phase 69: 64-Byte Cache-Line Perfection ─────────────────────────
+        static constexpr size_t StorageSize = 64 - sizeof(void*); // 56 bytes
+        const VTable* vtable_ = nullptr;
+        alignas(8) std::byte storage_[StorageSize];
+
+        void destroy() noexcept {
+            if (vtable_) {
+                vtable_->destroy(storage_);
+                vtable_ = nullptr;
+            }
+        }
+
+    public:
+        InlineTask() noexcept = default;
+        InlineTask(std::nullptr_t) noexcept {}
+
+        // ── Phase 69.3: Compile-time check against 56-byte storage ──────────
+        template <typename F>
+        requires (!std::is_same_v<std::decay_t<F>, InlineTask> && std::is_invocable_r_v<ReturnType, F, Args...>)
+        InlineTask(F&& f) {
+            using DecayedF = std::decay_t<F>;
+            static_assert(sizeof(DecayedF) <= StorageSize,
+                "FATAL: Task capture size exceeds SOO buffer (56 bytes). Heap allocation is strictly forbidden.");
+            static_assert(alignof(DecayedF) <= 8,
+                "FATAL: Alignment requirement exceeds buffer alignment.");
+            static_assert(std::is_nothrow_move_constructible_v<DecayedF>,
+                "FATAL: Callable must be noexcept move constructible to prevent std::terminate.");
+
+            ::new (storage_) DecayedF(std::forward<F>(f));
+            vtable_ = &vtable_for<DecayedF>;
+        }
+
+        ~InlineTask() {
+            destroy();
+        }
+
+        InlineTask(const InlineTask&) = delete;
+        InlineTask& operator=(const InlineTask&) = delete;
+
+        // ── Phase 70: Destructive Move Semantics ────────────────────────────
+        InlineTask(InlineTask&& other) noexcept {
+            if (other.vtable_) {
+                other.vtable_->move(other.storage_, storage_);
+                vtable_ = other.vtable_;
+                // CRITICAL: Destroy the moved-from state to release captured resources!
+                other.vtable_->destroy(other.storage_);
+                other.vtable_ = nullptr;
+            }
+        }
+
+        InlineTask& operator=(InlineTask&& other) noexcept {
+            if (this != &other) {
+                destroy();
+                if (other.vtable_) {
+                    other.vtable_->move(other.storage_, storage_);
+                    vtable_ = other.vtable_;
+                    // CRITICAL: Destroy the moved-from state to release captured resources!
+                    other.vtable_->destroy(other.storage_);
+                    other.vtable_ = nullptr;
+                }
+            }
+            return *this;
+        }
+
+        InlineTask& operator=(std::nullptr_t) noexcept {
+            destroy();
+            return *this;
+        }
+
+        ReturnType operator()(Args... args) {
+            if (!vtable_) [[unlikely]] {
+                #if defined(__has_builtin) && __has_builtin(__builtin_trap)
+                    __builtin_trap();
+                #else
+                    std::abort();
+                #endif
+            }
+            if constexpr (std::is_void_v<ReturnType>) {
+                vtable_->invoke(storage_, std::forward<Args>(args)...);
+            } else {
+                return vtable_->invoke(storage_, std::forward<Args>(args)...);
+            }
+        }
+
+        explicit operator bool() const noexcept {
+            return vtable_ != nullptr;
+        }
+    };
+
+    // ── Phase 69.4: Class-level L1 cache line assertion ───────────────────
+    static_assert(sizeof(InlineTask<void()>) == 64, "FATAL: InlineTask must pack exactly into one 64-byte L1 cache line.");
 }
 
 /**
@@ -82,10 +211,7 @@ public:
 
 class NexusThreadPool {
 public:
-    struct Task {
-        void (*func)(void*) = nullptr;
-        void* arg = nullptr;
-    };
+    using Task = nexus::InlineTask<void()>;
 
 private:
     static constexpr size_t QUEUE_SIZE = 4096;
@@ -112,8 +238,9 @@ public:
                 while (!stop_tok.stop_requested() && !stop_.load(std::memory_order_relaxed)) {
                     Task task;
                     if (task_queue_.dequeue(task)) {
-                        if (task.func) {
-                            task.func(task.arg);
+                        if (task) {
+                            task();
+                            task = nullptr; // CRITICAL: Destroys captured unique_ptr immediately!
                         }
                     } else {
                         std::this_thread::yield();
@@ -127,9 +254,8 @@ public:
         stop_.store(true, std::memory_order_relaxed);
     }
 
-    bool submit(void (*func)(void*), void* arg) {
-        Task task{func, arg};
-        return task_queue_.enqueue(std::move(task));
+    bool submit(Task func) {
+        return task_queue_.enqueue(std::move(func));
     }
 
     int get_numa_node() const { return numa_node_; }
@@ -173,12 +299,7 @@ public:
 };
 
 // Retrieve singleton instance of pool manager
-inline NexusNUMAThreadPoolManager& get_numa_pool_manager() {
-    static NexusNUMAThreadPoolManager manager;
-    return manager;
-}
+NexusNUMAThreadPoolManager& get_numa_pool_manager();
 
 // Retrieve backward-compatible global thread pool referring to NUMA node 0
-inline NexusThreadPool& get_global_thread_pool() {
-    return get_numa_pool_manager().get_pool(0);
-}
+NexusThreadPool& get_global_thread_pool();

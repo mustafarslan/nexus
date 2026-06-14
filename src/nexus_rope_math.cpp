@@ -80,3 +80,129 @@ void apply_relative_rope_shift(
         }
     }
 }
+
+void apply_absolute_rope_reanchor(
+    uint16_t* k_data,
+    uint32_t seq_len,
+    uint32_t n_head_kv,
+    uint32_t d_head,
+    uint32_t compiled_base_pos,
+    uint32_t target_base_pos,
+    float freq_base,
+    float freq_scale,
+    uint32_t scaling_type,
+    float ext_factor,
+    float beta_fast,
+    float beta_slow,
+    int n_ctx_orig) {
+    if (compiled_base_pos == target_base_pos || seq_len == 0) {
+        return;
+    }
+    const int32_t uniform_delta = static_cast<int32_t>(target_base_pos) - static_cast<int32_t>(compiled_base_pos);
+    if (scaling_type != 2) {
+        apply_relative_rope_shift(
+            k_data, seq_len, n_head_kv, d_head, uniform_delta,
+            freq_base, freq_scale, scaling_type, ext_factor, beta_fast, beta_slow, n_ctx_orig);
+        return;
+    }
+    for (uint32_t s = 0; s < seq_len; ++s) {
+        const int32_t compiled_pos = static_cast<int32_t>(compiled_base_pos + s);
+        const int32_t target_pos = static_cast<int32_t>(target_base_pos + s);
+        const int32_t delta_pos = target_pos - compiled_pos;
+        if (delta_pos == 0) {
+            continue;
+        }
+        std::vector<float> cos_vals(d_head / 2);
+        std::vector<float> sin_vals(d_head / 2);
+        for (uint32_t i = 0; i < d_head / 2; ++i) {
+            float theta = get_rope_frequency(
+                static_cast<int64_t>(2 * i), d_head, freq_base, freq_scale,
+                scaling_type, ext_factor, beta_fast, beta_slow, n_ctx_orig);
+            float phi = static_cast<float>(delta_pos) * theta;
+            cos_vals[i] = std::cos(phi);
+            sin_vals[i] = std::sin(phi);
+        }
+        for (uint32_t h = 0; h < n_head_kv; ++h) {
+            uint16_t* head_ptr = k_data + (s * n_head_kv * d_head) + (h * d_head);
+            for (uint32_t i = 0; i < d_head / 2; ++i) {
+                float x0 = ggml_fp16_to_fp32(head_ptr[2 * i]);
+                float x1 = ggml_fp16_to_fp32(head_ptr[2 * i + 1]);
+                float r0 = x0 * cos_vals[i] - x1 * sin_vals[i];
+                float r1 = x0 * sin_vals[i] + x1 * cos_vals[i];
+                head_ptr[2 * i] = ggml_fp32_to_fp16(r0);
+                head_ptr[2 * i + 1] = ggml_fp32_to_fp16(r1);
+            }
+        }
+    }
+}
+
+void apply_denominator_calibration_v2(
+    const float* prefix_k_norms,
+    size_t prefix_len,
+    const float* splice_k_norms,
+    size_t splice_len,
+    float* out_bias,
+    float* out_v_scales,
+    size_t kv_len,
+    float n_past_scale,
+    float target_p,
+    float compiled_p) {
+    if (out_bias && kv_len > 0) {
+        for (size_t i = 0; i < kv_len; ++i) {
+            out_bias[i] = 0.0f;
+        }
+    }
+    if (out_v_scales && kv_len > 0) {
+        for (size_t i = 0; i < kv_len; ++i) {
+            out_v_scales[i] = 1.0f;
+        }
+    }
+    if (!prefix_k_norms || !splice_k_norms || prefix_len == 0 || splice_len == 0 || kv_len == 0) {
+        return;
+    }
+
+    double prefix_sink = 0.0;
+    const size_t sink_n = std::min(prefix_len, size_t{4});
+    for (size_t i = 0; i < sink_n; ++i) {
+        prefix_sink += static_cast<double>(prefix_k_norms[i]);
+    }
+    prefix_sink /= static_cast<double>(sink_n);
+
+    double splice_mean = 0.0;
+    for (size_t i = 0; i < splice_len; ++i) {
+        splice_mean += static_cast<double>(splice_k_norms[i]);
+    }
+    splice_mean /= static_cast<double>(splice_len);
+
+    const double depth_ratio = std::log(
+        static_cast<double>(std::max(1.0f, target_p)) /
+        static_cast<double>(std::max(1.0f, compiled_p)));
+
+    const double deficit = std::log1p(std::max(0.0, prefix_sink - splice_mean)) * static_cast<double>(n_past_scale);
+    const float global_bias = static_cast<float>(-deficit * 0.15 - 0.15 * depth_ratio * static_cast<double>(n_past_scale));
+
+    for (size_t i = 0; i < kv_len && i < splice_len; ++i) {
+        const double local = static_cast<double>(splice_k_norms[i]);
+        const double rel = (splice_mean > 1e-6) ? (local / splice_mean - 1.0) : 0.0;
+        if (out_bias) {
+            out_bias[i] = global_bias + static_cast<float>(rel * -0.05);
+        }
+        if (out_v_scales) {
+            const double v_adj = -0.02 * depth_ratio * (1.0 - local / std::max(splice_mean, 1e-6));
+            out_v_scales[i] = static_cast<float>(std::exp(v_adj));
+        }
+    }
+}
+
+void apply_denominator_calibration(
+    const float* prefix_k_norms,
+    size_t prefix_len,
+    const float* splice_k_norms,
+    size_t splice_len,
+    float* out_bias,
+    size_t kv_len,
+    float n_past_scale) {
+    apply_denominator_calibration_v2(
+        prefix_k_norms, prefix_len, splice_k_norms, splice_len,
+        out_bias, nullptr, kv_len, n_past_scale, 1.0f, 1.0f);
+}

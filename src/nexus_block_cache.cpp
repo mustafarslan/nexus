@@ -9,20 +9,69 @@
 #include <filesystem>
 #include <latch>
 
-#if defined(_WIN32)
-#include <io.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#define open _open
-#define fstat _fstat
-#define close _close
-#define stat _stat
-#else
+alignas(128) HazardSlot NexusBlockCache::hazard_pointers[NexusBlockCache::MAX_THREADS];
+
+static bool is_entry_protected(CacheEntry* entry) {
+    if (!entry) return false;
+    for (size_t i = 0; i < NexusBlockCache::MAX_THREADS; ++i) {
+        if (NexusBlockCache::hazard_pointers[i].entry.load(std::memory_order_acquire) == entry) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Phase 54/56: Lock-free atomic telemetry counters as NexusBlockCache members
+NexusCacheTelemetry NexusBlockCache::get_cache_telemetry() const {
+    if (!telemetry_) return {0, 0, 0};
+    return {
+        .load_errors = telemetry_->load_errors.load(std::memory_order_relaxed),
+        .submit_rejections = telemetry_->submit_rejections.load(std::memory_order_relaxed),
+        .blocks_freed = telemetry_->blocks_freed.load(std::memory_order_relaxed),
+    };
+}
+
+// Phase 58: Aligned shared control block context for telemetry lifetimes
+struct LoadContext {
+    NexusBlockCache* cache;
+    std::string filepath;
+    void* mapped_data;
+    size_t size;
+    uint64_t gen;
+    int target_node;
+    std::shared_ptr<std::promise<std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode>>> promise;
+    std::atomic<bool> promise_fulfilled{false};
+    std::shared_ptr<NexusTelemetry> telemetry;
+
+    ~LoadContext() noexcept {
+        if (!promise_fulfilled.load(std::memory_order_acquire) && promise) {
+            try {
+                promise->set_value(std::unexpected(NexusErrorCode::RESOURCE_EXHAUSTED));
+            } catch (...) {
+                // Swallow exception to prevent std::terminate
+            }
+        }
+    }
+
+    // Non-copyable, non-movable
+    LoadContext(const LoadContext&) = delete;
+    LoadContext& operator=(const LoadContext&) = delete;
+    LoadContext(LoadContext&&) = delete;
+    LoadContext& operator=(LoadContext&&) = delete;
+
+    LoadContext(NexusBlockCache* cache_, std::string filepath_, void* mapped_data_,
+                size_t size_, uint64_t gen_, int target_node_,
+                std::shared_ptr<std::promise<std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode>>> promise_,
+                std::shared_ptr<NexusTelemetry> telemetry_)
+        : cache(cache_), filepath(std::move(filepath_)), mapped_data(mapped_data_),
+          size(size_), gen(gen_), target_node(target_node_), promise(std::move(promise_)),
+          telemetry(std::move(telemetry_)) {}
+};
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#endif
 
 extern "C" {
     void llama_unregister_host_memory(void * buffer);
@@ -30,8 +79,8 @@ extern "C" {
 }
 
 AeonToolBlock::AeonToolBlock(const std::string& atb_filepath, void* mapped_data, size_t file_size, 
-                             std::function<void(void*)> free_callback, std::function<void()> on_failure, uint64_t generation_id, int numa_node)
-    : mapped_data_(mapped_data), file_size_(file_size), free_callback_(free_callback), generation_id_(generation_id), numa_node_(numa_node) {
+                             std::function<void(void*)> free_callback, std::function<void()> on_failure, uint64_t generation_id, int numa_node, std::shared_ptr<NexusTelemetry> telemetry)
+    : mapped_data_(mapped_data), file_size_(file_size), free_callback_(free_callback), generation_id_(generation_id), numa_node_(numa_node), telemetry_(std::move(telemetry)) {
     if (!mapped_data_) {
         throw std::runtime_error("AeonToolBlock: mapped_data is null");
     }
@@ -46,6 +95,10 @@ AeonToolBlock::AeonToolBlock(const std::string& atb_filepath, void* mapped_data,
 }
 
 AeonToolBlock::~AeonToolBlock() {
+    // Phase 58: Shared telemetry block to prevent UAF
+    if (telemetry_) {
+        telemetry_->blocks_freed.fetch_add(1, std::memory_order_relaxed);
+    }
     if (residency_future_.valid()) {
         try {
             residency_future_.wait();
@@ -87,16 +140,23 @@ int NexusBlockCache::get_node_for_ptr(const void* ptr) const {
     return -1;
 }
 
+struct NumaInitBarrier {
+    std::mutex mtx;
+    std::condition_variable cv;
+    int active_tasks = 0;
+};
+
 struct NumaInitTaskCtx {
     NexusBlockCache* cache;
     int numa_node;
-    std::latch* latch;
+    std::shared_ptr<NumaInitBarrier> barrier;
     std::atomic<bool> success{true};
     std::exception_ptr exc_ptr;
 };
 
 NexusBlockCache::NexusBlockCache(size_t max_pinned_bytes) 
-    : shards_(std::make_unique<std::array<CacheShard, 64>>()) {
+    : telemetry_(std::make_shared<NexusTelemetry>()),
+      shards_(std::make_unique<std::array<CacheShard, 64>>()) {
     if (max_pinned_bytes == 0) {
         max_pinned_bytes = 16ULL * 1024 * 1024 * 1024; // Default to 16GB limit
     }
@@ -112,11 +172,13 @@ NexusBlockCache::NexusBlockCache(size_t max_pinned_bytes)
     int node_count = get_numa_node_count();
     if (node_count <= 0) node_count = 1;
 
+    eviction_queues_ = std::make_unique<NUMAEvictionQueue[]>(node_count);
     arena_bases_.reserve(node_count);
     arena_sizes_.reserve(node_count);
     allocators_.reserve(node_count);
     page_generations_.resize(node_count);
     page_entries_.resize(node_count);
+    num_numa_nodes_ = node_count;
 
     for (int i = 0; i < node_count; ++i) {
         void* base = get_memory_manager()->allocate_huge_arena(arena_size, i);
@@ -145,50 +207,60 @@ NexusBlockCache::NexusBlockCache(size_t max_pinned_bytes)
     // Force initialization of NUMA thread pools to start background worker polling
     (void)get_numa_pool_manager();
 
-    std::latch latch(node_count);
-    std::vector<NumaInitTaskCtx> init_contexts(node_count);
+    auto barrier = std::make_shared<NumaInitBarrier>();
+    barrier->active_tasks = node_count;
 
-    struct LatchGuard {
-        std::latch& latch_ref;
-        ~LatchGuard() {
-            latch_ref.count_down();
-        }
-    };
+    std::vector<std::shared_ptr<NumaInitTaskCtx>> tasks;
+    tasks.reserve(node_count);
 
     for (int i = 0; i < node_count; ++i) {
-        init_contexts[i].cache = this;
-        init_contexts[i].numa_node = i;
-        init_contexts[i].latch = &latch;
+        auto task = std::make_shared<NumaInitTaskCtx>();
+        task->cache = this;
+        task->numa_node = i;
+        task->barrier = barrier;
+        tasks.push_back(task);
 
-        auto worker_fn = [](void* arg) {
-            auto* ctx = static_cast<NumaInitTaskCtx*>(arg);
-            LatchGuard guard(*(ctx->latch));
+        if (!get_numa_pool_manager().get_pool(i).submit([task]() {
             try {
-                ctx->cache->initialize_numa_arena(ctx->numa_node);
+                task->cache->initialize_numa_arena(task->numa_node);
             } catch (...) {
-                ctx->success.store(false, std::memory_order_release);
-                ctx->exc_ptr = std::current_exception();
+                task->success.store(false, std::memory_order_release);
+                task->exc_ptr = std::current_exception();
             }
-        };
 
-        if (!get_numa_pool_manager().get_pool(i).submit(worker_fn, &init_contexts[i])) {
-            init_contexts[i].success.store(false, std::memory_order_release);
-            latch.count_down();
+            std::shared_ptr<NumaInitBarrier> barr = task->barrier;
+            {
+                std::lock_guard<std::mutex> lock(barr->mtx);
+                barr->active_tasks--;
+                if (barr->active_tasks == 0) {
+                    barr->cv.notify_one();
+                }
+            }
+        })) {
+            task->success.store(false, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(barrier->mtx);
+            barrier->active_tasks--;
+            if (barrier->active_tasks == 0) {
+                barrier->cv.notify_one();
+            }
         }
     }
 
-    latch.wait();
+    {
+        std::unique_lock<std::mutex> lock(barrier->mtx);
+        barrier->cv.wait(lock, [&]() { return barrier->active_tasks == 0; });
+    }
 
     // Validate initialization success
     for (int i = 0; i < node_count; ++i) {
-        if (!init_contexts[i].success.load(std::memory_order_acquire)) {
+        if (!tasks[i]->success.load(std::memory_order_acquire)) {
             // Rollback already initialized and registered host memory
             for (size_t j = 0; j < arena_bases_.size(); ++j) {
                 llama_unregister_host_memory(arena_bases_[j]);
                 get_memory_manager()->free_huge_arena(arena_bases_[j], arena_sizes_[j]);
             }
-            if (init_contexts[i].exc_ptr) {
-                std::rethrow_exception(init_contexts[i].exc_ptr);
+            if (tasks[i]->exc_ptr) {
+                std::rethrow_exception(tasks[i]->exc_ptr);
             } else {
                 throw std::runtime_error("NexusBlockCache: NUMA Node " + std::to_string(i) + " initialization failed.");
             }
@@ -224,6 +296,23 @@ NexusBlockCache::~NexusBlockCache() {
             delete pair.second;
         }
     }
+    // Clean up retired entries
+    {
+        std::lock_guard<std::mutex> lock(retired_mutex_);
+        for (auto* entry : retired_entries_) {
+            delete entry;
+        }
+        retired_entries_.clear();
+    }
+    // Phase 34: eviction_queues_ list pointers become dangling after entries are deleted
+    // above. Clear them to prevent accidental double-free in destructor order variations.
+    for (size_t i = 0; i < num_numa_nodes_; ++i) {
+        auto& eq = eviction_queues_[i];
+        eq.probation_head = nullptr;
+        eq.probation_tail = nullptr;
+        eq.protected_head = nullptr;
+        eq.protected_tail = nullptr;
+    }
     shards_.reset();
     for (size_t i = 0; i < arena_bases_.size(); ++i) {
         if (arena_bases_[i]) {
@@ -244,7 +333,7 @@ uint64_t NexusBlockCache::get_current_generation(void* mapped_data) const {
     return 0;
 }
 
-std::shared_ptr<AeonToolBlock> NexusBlockCache::get_or_load(std::string_view atb_filepath) {
+std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode> NexusBlockCache::get_or_load(std::string_view atb_filepath) {
     uint64_t hash = get_filepath_hash(atb_filepath);
     size_t shard_idx = hash % 64;
     auto& shard = (*shards_)[shard_idx];
@@ -259,8 +348,12 @@ std::shared_ptr<AeonToolBlock> NexusBlockCache::get_or_load(std::string_view atb
     }
 
     if (entry) {
-        entry->last_access_tick.store(global_tick_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-        return entry->future.get();
+        HazardGuard guard(entry);
+        if (guard.entry) {
+            entry->referenced.store(true, std::memory_order_relaxed);
+            auto block_or_err = entry->future.get();
+            return block_or_err;
+        }
     }
 
     std::error_code ec;
@@ -270,108 +363,139 @@ std::shared_ptr<AeonToolBlock> NexusBlockCache::get_or_load(std::string_view atb
         throw std::runtime_error("NexusBlockCache: Failed to stat ATB file or file too small: " + filepath_str);
     }
 
-    // Evict old entries BEFORE locking the shard to prevent deadlock/livelock
-    evict_to_limit(actual_file_size);
-
-    std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
-    auto it = shard.cache_map.find(atb_filepath);
-    if (it != shard.cache_map.end()) {
-        entry = it->second;
-        write_lock.unlock();
-        current_pinned_bytes_.fetch_sub(actual_file_size, std::memory_order_relaxed);
-        entry->last_access_tick.store(global_tick_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-        return entry->future.get();
-    }
-
-    uint64_t gen = global_generation_.fetch_add(1, std::memory_order_relaxed);
-    auto promise = std::make_shared<std::promise<std::shared_ptr<AeonToolBlock>>>();
-    std::shared_future<std::shared_ptr<AeonToolBlock>> future = promise->get_future().share();
-
     // Allocate memory block from target GPU NUMA node
     int target_node = discover_gpu_numa_node();
     if (target_node < 0 || target_node >= static_cast<int>(allocators_.size())) {
         target_node = 0;
     }
 
-    void* mapped_data = allocators_[target_node]->allocate(actual_file_size);
-    if (!mapped_data) {
-        // Under high concurrency, another thread might have stolen our evicted page slot.
-        // Unlock, evict another block, and retry up to 5 times.
-        for (int retry = 0; retry < 5; ++retry) {
-            write_lock.unlock();
-            evict_to_limit(actual_file_size);
-            write_lock.lock();
+    // 1. Evict to make room (locks and unlocks target NUMA eviction queue internally)
+    evict_to_limit(actual_file_size, target_node);
 
-            // Check if another thread loaded the exact same tool block in the meantime
-            auto retry_it = shard.cache_map.find(atb_filepath);
-            if (retry_it != shard.cache_map.end()) {
-                entry = retry_it->second;
-                write_lock.unlock();
-                current_pinned_bytes_.fetch_sub(actual_file_size, std::memory_order_relaxed);
-                entry->last_access_tick.store(global_tick_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-                return entry->future.get();
-            }
+    // 2. Lock both NUMA eviction queue and shard mutex in strict order to avoid deadlock:
+    //    eviction_queues_[target_node].mtx  →  shard.mutex
+    std::unique_lock<std::mutex> evict_lock(eviction_queues_[target_node].mtx);
+    std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
 
-            mapped_data = allocators_[target_node]->allocate(actual_file_size);
-            if (mapped_data) {
-                break;
-            }
+    // Recheck under lock
+    auto it = shard.cache_map.find(atb_filepath);
+    if (it != shard.cache_map.end()) {
+        entry = it->second;
+        HazardGuard guard(entry);
+        write_lock.unlock();
+        evict_lock.unlock();
+        current_pinned_bytes_.fetch_sub(actual_file_size, std::memory_order_relaxed);
+        if (guard.entry) {
+            entry->referenced.store(true, std::memory_order_relaxed);
+            auto block_or_err = entry->future.get();
+            return block_or_err;
         }
     }
 
-    if (!mapped_data) {
+    void* mapped_data = allocators_[target_node]->allocate(actual_file_size);
+    if (mapped_data) {
+        uint64_t gen = global_generation_.fetch_add(1, std::memory_order_relaxed);
+        auto promise = std::make_shared<std::promise<std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode>>>();
+        std::shared_future<std::expected<std::shared_ptr<AeonToolBlock>, NexusErrorCode>> future = promise->get_future().share();
+
+        entry = new CacheEntry();
+        entry->future = future;
+        entry->generation_id = gen;
+        entry->filepath = filepath_str;
+        entry->byte_size = actual_file_size;
+        entry->is_protected = false;
+        entry->referenced.store(false, std::memory_order_relaxed);
+        entry->evicted = false;
+
+        HazardGuard guard(entry); // Protect during load
+
+        // Set page generations and entries
+        size_t start_page = (static_cast<char*>(mapped_data) - static_cast<char*>(arena_bases_[target_node])) / NEXUS_PAGE_ALIGNMENT;
+        size_t num_pages = (actual_file_size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
+        for (size_t i = 0; i < num_pages; ++i) {
+            page_generations_[target_node][start_page + i].store(gen, std::memory_order_release);
+            page_entries_[target_node][start_page + i].store(entry, std::memory_order_release);
+        }
+
+        // Push new entry to this NUMA node's probation list and register in shard
+        entry->numa_node = target_node;
+        auto& eq = eviction_queues_[target_node];
+        list_push_front(eq.probation_head, eq.probation_tail, entry);
+        shard.cache_map.emplace(filepath_str, entry);
+
         write_lock.unlock();
-        current_pinned_bytes_.fetch_sub(actual_file_size, std::memory_order_relaxed);
-        throw std::runtime_error("NexusBlockCache: Out of HugeTLB memory pool for " + filepath_str);
-    }
+        evict_lock.unlock();
 
-    entry = new CacheEntry();
-    entry->future = future;
-    entry->last_access_tick.store(global_tick_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-    entry->generation_id = gen;
-    entry->filepath = filepath_str;
-    entry->byte_size = actual_file_size;
+        auto safe_ctx = std::make_unique<LoadContext>(
+            this, filepath_str, mapped_data, actual_file_size, gen, target_node, promise, telemetry_
+        );
 
-    // Set page generations and entries
-    size_t start_page = (static_cast<char*>(mapped_data) - static_cast<char*>(arena_bases_[target_node])) / NEXUS_PAGE_ALIGNMENT;
-    size_t num_pages = (actual_file_size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
-    for (size_t i = 0; i < num_pages; ++i) {
-        page_generations_[target_node][start_page + i].store(gen, std::memory_order_release);
-        page_entries_[target_node][start_page + i].store(entry, std::memory_order_release);
-    }
-
-    entry->vector_index = shard.keys.size();
-    shard.keys.push_back(entry);
-    shard.cache_map.emplace(filepath_str, entry);
-    write_lock.unlock();
-
-    std::shared_ptr<AeonToolBlock> block = nullptr;
-    try {
-        block = std::make_shared<AeonToolBlock>(filepath_str, mapped_data, actual_file_size, [this, actual_file_size](void* ptr) {
+        bool submit_success = get_numa_pool_manager().get_pool(target_node).submit([ctx = std::move(safe_ctx)]() mutable {
+            try {
+                auto block = std::make_shared<AeonToolBlock>(
+                    ctx->filepath, ctx->mapped_data, ctx->size,
+                    [cache = ctx->cache, size = ctx->size, telemetry = ctx->telemetry](void* ptr) {
+                        // Phase 58: Shared telemetry block to avoid UAF
+                        telemetry->blocks_freed.fetch_add(1, std::memory_order_relaxed);
 #if defined(__APPLE__)
-            std::memset(ptr, 0, 128);
+                        std::memset(ptr, 0, 128);
 #endif
-            int node_idx = this->get_node_for_ptr(ptr);
-            if (node_idx != -1) {
-                size_t start_page = (static_cast<char*>(ptr) - static_cast<char*>(this->arena_bases_[node_idx])) / NEXUS_PAGE_ALIGNMENT;
-                size_t num_pages = (actual_file_size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
-                for (size_t i = 0; i < num_pages; ++i) {
-                    this->page_generations_[node_idx][start_page + i].store(0, std::memory_order_release);
-                    this->page_entries_[node_idx][start_page + i].store(nullptr, std::memory_order_release);
-                }
-                this->allocators_[node_idx]->free(ptr, actual_file_size);
+                        int node_idx = cache->get_node_for_ptr(ptr);
+                        if (node_idx != -1) {
+                            size_t start_page = (static_cast<char*>(ptr) - static_cast<char*>(cache->arena_bases_[node_idx])) / NEXUS_PAGE_ALIGNMENT;
+                            size_t num_pages = (size + NEXUS_PAGE_ALIGNMENT - 1) / NEXUS_PAGE_ALIGNMENT;
+                            for (size_t i = 0; i < num_pages; ++i) {
+                                cache->page_generations_[node_idx][start_page + i].store(0, std::memory_order_release);
+                                cache->page_entries_[node_idx][start_page + i].store(nullptr, std::memory_order_release);
+                            }
+                            cache->allocators_[node_idx]->free(ptr, size);
+                        } else {
+                            telemetry->load_errors.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    },
+                    [cache = ctx->cache, filepath = ctx->filepath, gen = ctx->gen]() {
+                        cache->on_load_failure(filepath, gen);
+                    },
+                    ctx->gen, ctx->target_node,
+                    ctx->telemetry
+                );
+                
+                block->wait_until_resident();
+                ctx->promise->set_value(block);
+                ctx->promise_fulfilled.store(true, std::memory_order_release);
+            } catch (const std::bad_alloc&) {
+                ctx->telemetry->load_errors.fetch_add(1, std::memory_order_relaxed);
+                ctx->cache->on_load_failure(ctx->filepath, ctx->gen);
+                ctx->promise->set_value(std::unexpected(NexusErrorCode::RESOURCE_EXHAUSTED));
+                ctx->promise_fulfilled.store(true, std::memory_order_release);
+            } catch (const std::exception&) {
+                ctx->telemetry->load_errors.fetch_add(1, std::memory_order_relaxed);
+                ctx->cache->on_load_failure(ctx->filepath, ctx->gen);
+                ctx->promise->set_value(std::unexpected(NexusErrorCode::INTERNAL_ERROR));
+                ctx->promise_fulfilled.store(true, std::memory_order_release);
+            } catch (...) {
+                ctx->telemetry->load_errors.fetch_add(1, std::memory_order_relaxed);
+                ctx->cache->on_load_failure(ctx->filepath, ctx->gen);
+                ctx->promise->set_value(std::unexpected(NexusErrorCode::INTERNAL_ERROR));
+                ctx->promise_fulfilled.store(true, std::memory_order_release);
             }
-        }, [this, filepath_str, gen]() {
-            this->on_load_failure(filepath_str, gen);
-        }, gen, target_node);
-        promise->set_value(block);
-    } catch (...) {
-        promise->set_exception(std::current_exception());
-        this->on_load_failure(filepath_str, gen);
-        throw;
+        });
+
+        if (!submit_success) {
+            telemetry_->submit_rejections.fetch_add(1, std::memory_order_relaxed);
+            on_load_failure(filepath_str, gen);
+            // safe_ctx goes out of scope and handles promise fulfillment.
+        }
+
+        auto block_or_err = entry->future.get();
+        return block_or_err;
     }
 
-    return block;
+    write_lock.unlock();
+    evict_lock.unlock();
+    current_pinned_bytes_.fetch_sub(actual_file_size, std::memory_order_relaxed);
+
+    return std::unexpected(NexusErrorCode::RESOURCE_EXHAUSTED);
 }
 
 CacheEntry* NexusBlockCache::get_entry_from_ptr(void* mapped_data) const {
@@ -385,15 +509,59 @@ CacheEntry* NexusBlockCache::get_entry_from_ptr(void* mapped_data) const {
     return nullptr;
 }
 
+void NexusBlockCache::retire_entry(CacheEntry* entry) {
+    if (!entry) return;
+    std::lock_guard<std::mutex> lock(retired_mutex_);
+    retired_entries_.push_back(entry);
+}
+
+void NexusBlockCache::reclaim_retired_entries() {
+    std::lock_guard<std::mutex> lock(retired_mutex_);
+    auto it = retired_entries_.begin();
+    while (it != retired_entries_.end()) {
+        CacheEntry* entry = *it;
+        if (!is_entry_protected(entry)) {
+            delete entry;
+            it = retired_entries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+namespace nexus {
+    int get_thread_slot_index() {
+        static std::atomic<int> next_slot{0};
+        thread_local int slot = next_slot.fetch_add(1, std::memory_order_relaxed) % NexusBlockCache::MAX_THREADS;
+        return slot;
+    }
+}
+
+void NexusBlockCache::release_entry(CacheEntry* entry) {
+    // No-op under Hazard Pointer scheme
+}
+
 HazardGuard::HazardGuard(CacheEntry* e) : entry(e) {
     if (entry) {
-        entry->active_readers.fetch_add(1, std::memory_order_acquire);
+        int slot = nexus::get_thread_slot_index();
+        NexusBlockCache::hazard_pointers[slot].entry.store(entry, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (entry->evicted.load(std::memory_order_acquire)) {
+            NexusBlockCache::hazard_pointers[slot].entry.store(nullptr, std::memory_order_release);
+            entry = nullptr;
+        }
     }
 }
 
 HazardGuard::~HazardGuard() {
+    release();
+}
+
+void HazardGuard::release() {
     if (entry) {
-        entry->active_readers.fetch_sub(1, std::memory_order_release);
+        int slot = nexus::get_thread_slot_index();
+        NexusBlockCache::hazard_pointers[slot].entry.store(nullptr, std::memory_order_release);
+        entry = nullptr;
     }
 }
 
@@ -403,9 +571,7 @@ HazardGuard::HazardGuard(HazardGuard&& other) noexcept : entry(other.entry) {
 
 HazardGuard& HazardGuard::operator=(HazardGuard&& other) noexcept {
     if (this != &other) {
-        if (entry) {
-            entry->active_readers.fetch_sub(1, std::memory_order_release);
-        }
+        release();
         entry = other.entry;
         other.entry = nullptr;
     }
@@ -420,13 +586,44 @@ HazardGuard NexusBlockCache::acquire_hazard(void* mapped_data) {
 void NexusBlockCache::release_hazard(void* mapped_data) {
     CacheEntry* entry = get_entry_from_ptr(mapped_data);
     if (entry) {
-        entry->active_readers.fetch_sub(1, std::memory_order_release);
+        int slot = nexus::get_thread_slot_index();
+        NexusBlockCache::hazard_pointers[slot].entry.store(nullptr, std::memory_order_release);
     }
 }
 
 void NexusBlockCache::register_tool_path(uint32_t tool_id, const std::string& path) {
     std::unique_lock<std::shared_mutex> lock(tool_id_map_mutex_);
     tool_id_to_path_[tool_id] = path;
+}
+
+void NexusBlockCache::pin_tool(uint32_t tool_id) {
+    std::unique_lock<std::shared_mutex> lock(pinned_mutex_);
+    pinned_tool_ids_.insert(tool_id);
+}
+
+void NexusBlockCache::unpin_tool(uint32_t tool_id) {
+    std::unique_lock<std::shared_mutex> lock(pinned_mutex_);
+    pinned_tool_ids_.erase(tool_id);
+}
+
+bool NexusBlockCache::is_tool_pinned(uint32_t tool_id) const {
+    std::shared_lock<std::shared_mutex> lock(pinned_mutex_);
+    return pinned_tool_ids_.count(tool_id) > 0;
+}
+
+bool NexusBlockCache::is_path_pinned(const std::string& path) const {
+    std::shared_lock<std::shared_mutex> pin_lock(pinned_mutex_);
+    if (pinned_tool_ids_.empty()) {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> map_lock(tool_id_map_mutex_);
+    for (uint32_t tool_id : pinned_tool_ids_) {
+        auto it = tool_id_to_path_.find(tool_id);
+        if (it != tool_id_to_path_.end() && it->second == path) {
+            return true;
+        }
+    }
+    return false;
 }
 
 HazardGuard NexusBlockCache::hazard_guard(uint32_t tool_id) {
@@ -466,15 +663,24 @@ void NexusBlockCache::prefetch(std::string_view atb_filepath) {
 
     std::shared_ptr<AeonToolBlock> block = nullptr;
     if (entry) {
-        entry->last_access_tick.store(global_tick_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-        try {
-            block = entry->future.get();
-        } catch (...) {
-            return;
+        HazardGuard guard(entry);
+        if (guard.entry) {
+            entry->referenced.store(true, std::memory_order_relaxed);
+            auto res = entry->future.get();
+            if (res.has_value()) [[likely]] {
+                block = res.value();
+            } else [[unlikely]] {
+                // handle error
+            }
         }
     } else {
         try {
-            block = get_or_load(atb_filepath);
+            auto res = get_or_load(atb_filepath);
+            if (res.has_value()) [[likely]] {
+                block = res.value();
+            } else [[unlikely]] {
+                // handle error
+            }
         } catch (...) {
             return;
         }
@@ -490,93 +696,157 @@ void NexusBlockCache::on_load_failure(std::string_view atb_filepath, uint64_t fa
     size_t shard_idx = hash % 64;
     auto& shard = (*shards_)[shard_idx];
 
+    // Phase 34: We need the entry to find which NUMA queue it belongs to.
+    // Lock shard first to find the entry's numa_node, then lock the eviction queue.
+    // Since we might not know the node yet, peek under shard lock first.
+    int entry_node = 0;
+    {
+        std::shared_lock<std::shared_mutex> peek_lock(shard.mutex);
+        auto it = shard.cache_map.find(atb_filepath);
+        if (it != shard.cache_map.end() && it->second->generation_id == failed_gen) {
+            entry_node = it->second->numa_node;
+        } else {
+            return; // Entry already removed or generation mismatch
+        }
+    }
+
+    std::unique_lock<std::mutex> evict_lock(eviction_queues_[entry_node].mtx);
     std::unique_lock<std::shared_mutex> cleanup_lock(shard.mutex);
+
     auto it = shard.cache_map.find(atb_filepath);
     if (it != shard.cache_map.end() && it->second->generation_id == failed_gen) {
         CacheEntry* entry = it->second;
-        size_t v_idx = entry->vector_index;
-        if (v_idx < shard.keys.size()) {
-            if (v_idx != shard.keys.size() - 1) {
-                CacheEntry* back_entry = shard.keys.back();
-                shard.keys[v_idx] = back_entry;
-                back_entry->vector_index = v_idx;
-            }
-            shard.keys.pop_back();
+        auto& eq = eviction_queues_[entry->numa_node];
+        if (entry->is_protected) {
+            list_remove(eq.protected_head, eq.protected_tail, entry);
+        } else {
+            list_remove(eq.probation_head, eq.probation_tail, entry);
         }
         size_t evicted_size = entry->byte_size;
         shard.cache_map.erase(it);
-        delete entry;
+        entry->evicted.store(true, std::memory_order_release);
         current_pinned_bytes_.fetch_sub(evicted_size, std::memory_order_relaxed);
+
+        cleanup_lock.unlock();
+        evict_lock.unlock();
+
+        if (!is_entry_protected(entry)) {
+            delete entry;
+        } else {
+            retire_entry(entry);
+        }
     }
 }
 
-void NexusBlockCache::evict_to_limit(size_t required_bytes) {
-    constexpr size_t K = 5;
+void NexusBlockCache::evict_to_limit(size_t required_bytes, int target_node) {
+    reclaim_retired_entries();
+    auto try_evict_from_node = [&](int node_idx) -> bool {
+        std::unique_lock<std::mutex> evict_lock(eviction_queues_[node_idx].mtx);
+        auto& eq = eviction_queues_[node_idx];
+        CacheEntry* candidate = nullptr;
+
+        // Pass 1: Scan probation tailward for an unreferenced, inactive entry
+        CacheEntry* curr = eq.probation_tail;
+        while (curr) {
+            if (is_entry_protected(curr)) {
+                curr = curr->prev_lru;
+                continue;
+            }
+            if (curr->referenced.load(std::memory_order_relaxed)) {
+                // Promote probation block to protected queue
+                curr->referenced.store(false, std::memory_order_relaxed);
+                curr->is_protected = true;
+                CacheEntry* prev = curr->prev_lru;
+                list_remove(eq.probation_head, eq.probation_tail, curr);
+                list_push_front(eq.protected_head, eq.protected_tail, curr);
+                curr = prev;
+            } else {
+                if (!is_path_pinned(curr->filepath)) {
+                    candidate = curr;
+                    break;
+                }
+                curr = curr->prev_lru;
+            }
+        }
+
+        // Pass 2: Sweep protected list tailward to demote inactive entries
+        if (!candidate) {
+            curr = eq.protected_tail;
+            while (curr) {
+                if (is_entry_protected(curr)) {
+                    curr = curr->prev_lru;
+                    continue;
+                }
+                if (curr->referenced.load(std::memory_order_relaxed)) {
+                    curr->referenced.store(false, std::memory_order_relaxed);
+                    CacheEntry* prev = curr->prev_lru;
+                    list_remove(eq.protected_head, eq.protected_tail, curr);
+                    list_push_front(eq.protected_head, eq.protected_tail, curr);
+                    curr = prev;
+                } else {
+                    // Demote protected block to probation queue and mark as candidate
+                    curr->is_protected = false;
+                    CacheEntry* prev = curr->prev_lru;
+                    list_remove(eq.protected_head, eq.protected_tail, curr);
+                    list_push_front(eq.probation_head, eq.probation_tail, curr);
+                    if (!is_path_pinned(curr->filepath)) {
+                        candidate = curr;
+                        break;
+                    }
+                    curr = prev;
+                }
+            }
+        }
+
+        if (!candidate) {
+            return false; // No evictable candidates on this node
+        }
+
+        // Remove from list
+        if (candidate->is_protected) {
+            list_remove(eq.protected_head, eq.protected_tail, candidate);
+        } else {
+            list_remove(eq.probation_head, eq.probation_tail, candidate);
+        }
+
+        // Release eviction lock before acquiring shard lock (lock ordering)
+        evict_lock.unlock();
+
+        // Erase from shard map
+        uint64_t hash = get_filepath_hash(candidate->filepath);
+        size_t shard_idx = hash % 64;
+        auto& shard = (*shards_)[shard_idx];
+
+        {
+            std::unique_lock<std::shared_mutex> shard_lock(shard.mutex);
+            shard.cache_map.erase(candidate->filepath);
+        }
+
+        size_t evicted_size = candidate->byte_size;
+        candidate->evicted.store(true, std::memory_order_release);
+        if (!is_entry_protected(candidate)) {
+            delete candidate;
+        } else {
+            retire_entry(candidate);
+        }
+        current_pinned_bytes_.fetch_sub(evicted_size, std::memory_order_relaxed);
+        return true;
+    };
 
     while (current_pinned_bytes_.load(std::memory_order_relaxed) + required_bytes > max_pinned_bytes_) {
-        CacheEntry* oldest_entry = nullptr;
-        uint64_t lowest_tick = std::numeric_limits<uint64_t>::max();
-        size_t oldest_shard_idx = 0;
-
-        size_t sampled = 0;
-        for (size_t s = 0; s < K; ++s) {
-            size_t s_idx = nexus::get_random_value() % 64;
-            auto& shard = (*shards_)[s_idx];
-
-            std::shared_lock<std::shared_mutex> shard_lock(shard.mutex);
-            if (!shard.keys.empty()) {
-                size_t k_idx = nexus::get_random_value() % shard.keys.size();
-                CacheEntry* entry = shard.keys[k_idx];
-                if (entry) {
-                    if (entry->active_readers.load(std::memory_order_relaxed) > 0) {
-                        continue;
-                    }
-                    auto status = entry->future.wait_for(std::chrono::seconds(0));
-                    if (status == std::future_status::ready) {
-                        try {
-                            auto block = entry->future.get();
-                            if (block) {
-                                uint64_t tick = entry->last_access_tick.load(std::memory_order_relaxed);
-                                if (tick < lowest_tick) {
-                                    lowest_tick = tick;
-                                    oldest_shard_idx = s_idx;
-                                    oldest_entry = entry;
-                                }
-                                sampled++;
-                            }
-                        } catch (...) {
-                            oldest_shard_idx = s_idx;
-                            oldest_entry = entry;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!oldest_entry) {
-            break;
-        }
-
-        auto& target_shard = (*shards_)[oldest_shard_idx];
-        std::unique_lock<std::shared_mutex> write_lock(target_shard.mutex);
-        auto it = target_shard.cache_map.find(oldest_entry->filepath);
-        if (it != target_shard.cache_map.end() && it->second == oldest_entry) {
-            size_t v_idx = oldest_entry->vector_index;
-            if (v_idx < target_shard.keys.size()) {
-                if (v_idx != target_shard.keys.size() - 1) {
-                    CacheEntry* back_entry = target_shard.keys.back();
-                    target_shard.keys[v_idx] = back_entry;
-                    back_entry->vector_index = v_idx;
-                }
-                target_shard.keys.pop_back();
-            }
-            size_t evicted_size = oldest_entry->byte_size;
-            target_shard.cache_map.erase(it);
-            delete oldest_entry;
-            current_pinned_bytes_.fetch_sub(evicted_size, std::memory_order_relaxed);
+        if (!try_evict_from_node(target_node)) {
+            break; // No more evictable blocks on this node
         }
     }
 
     current_pinned_bytes_.fetch_add(required_bytes, std::memory_order_relaxed);
+}
+
+NexusNUMAThreadPoolManager& get_numa_pool_manager() {
+    static NexusNUMAThreadPoolManager manager;
+    return manager;
+}
+
+NexusThreadPool& get_global_thread_pool() {
+    return get_numa_pool_manager().get_pool(0);
 }
