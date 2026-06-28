@@ -460,7 +460,13 @@ NB_MODULE(nexus_fsm_ext, m) {
         .def("get_telemetry", &NexusOrchestrator::get_telemetry)
         .def("pin_warm_tool", &NexusOrchestrator::pin_warm_tool, nb::arg("tool_id"))
         .def("pin_block_tool", &NexusOrchestrator::pin_block_tool, nb::arg("tool_id"))
-        .def("get_splice_guard_fallback_count", &NexusOrchestrator::get_splice_guard_fallback_count);
+        .def("get_splice_guard_fallback_count", &NexusOrchestrator::get_splice_guard_fallback_count)
+        .def("get_deep_path_entered", &NexusOrchestrator::get_deep_path_entered)
+        .def("get_deep_path_l0_hit", &NexusOrchestrator::get_deep_path_l0_hit)
+        .def("get_deep_path_l0_miss", &NexusOrchestrator::get_deep_path_l0_miss)
+        .def("get_deep_path_text_fallback", &NexusOrchestrator::get_deep_path_text_fallback)
+        .def("get_last_deep_n_past", &NexusOrchestrator::get_last_deep_n_past)
+        .def("get_last_deep_best_end", &NexusOrchestrator::get_last_deep_best_end);
 
     m.def("allocate_request_seq", &NexusRadixPrefixCache::allocate_request_seq, nb::arg("request_index"));
 }

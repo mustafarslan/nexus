@@ -1,153 +1,218 @@
-# Project Nexus v1.0: Hybrid C++23 Agentic Routing Engine and KV-Cache MMU
+# Nexus
 
-Project Nexus is a **Hybrid C++23 Agentic Routing Engine and KV-Cache MMU** on **llama.cpp**. It accelerates MCP tool routing by pre-compiling tool schemas into offline `.atb` KV blocks, routing via quantized retrieval and a radix trie FSM, and splicing KV into the active context within strict physical boundaries.
+Nexus is a research prototype for **low-latency tool routing in LLM agents**. It cuts the
+time-to-first-token (TTFT) of a tool-augmented turn by skipping the most expensive part of
+that turn — re-prefilling the chosen tool's schema into the model's KV cache — and instead
+**splicing a precompiled KV block** (the tool's "page") directly into the cache. A small
+suffix is recomputed to stitch the splice to the live context, and a calibrated retrieval +
+cross-encoder gate decides *which* tool to splice.
 
-**v1.0 production headline:** Gateway TTFT P50 **171 ms**, E2E tool-hit **0.91** (n=100, Qwen2.5-14B-Instruct Q4_K_M). Source: [`results/bench_gateway_e2e_v2.json`](results/bench_gateway_e2e_v2.json).
-
-**Honest speedup:** **2.8×** vs B3 retrieve-and-prefill (N1 **466 ms** vs B3 **1.32 s**). The **153×** bloat strawman is retired.
-
-Release notes: [`RELEASE_V1.md`](RELEASE_V1.md) · Architecture: [`docs/architecture.md`](docs/architecture.md) · Internals: [`docs/internals.md`](docs/internals.md)
-
-> **Models are not in Git.** Weights (`.gguf`), KV binaries (`.atb`), and finetuned checkpoints are gitignored. Train CE v3 locally before running gateway benchmarks:
->
-> ```sh
-> python3 scripts/train_cross_encoder.py --output results/tool_cross_encoder_finetuned_v3
-> ```
+On the one configuration where the mechanism is validated end-to-end, this delivers a
+**2.47× median true-TTFT speedup with no detectable accuracy gap** at n=100. The rest of this
+document is about exactly what that claim covers and what it does not.
 
 ---
 
-## 1. The Prefill Compute Wall
+## The core idea
 
-| Baseline | TTFT P50 | Role |
-|----------|----------|------|
-| B1 (full bloat, 12.5k tokens) | **9.48 s** | Strawman — do not cite |
-| B3 (retrieve + single schema) | **1.33 s** | **Honest baseline** |
-| GW_route (gateway production) | **171 ms** | **v1.0 headline** |
-| N1 (splice + 5% suffix) | **466 ms** | Fast path at P≤256 |
+A normal tool-using turn pays for the tool's schema twice over: once to retrieve it, and again
+to *prefill* it — run every schema token through the transformer to populate the KV cache —
+before the model can emit its first output token. Prefill is compute-bound and grows with
+schema length, so for realistic tool schemas it dominates TTFT.
+
+Nexus precompiles each tool's schema into an **`.atb` file** (Aeon Tool Block): a frozen,
+model-bound snapshot of the K and V tensors that a normal prefill *would* have produced. At
+runtime, instead of prefilling, Nexus:
+
+1. **Retrieves** the likely tool with an INT8 SIMD dense router (the SLB) over tool embeddings.
+2. **Gates** the decision: if the top-1 margin is confident it auto-routes; otherwise a
+   calibrated cross-encoder reranks before committing.
+3. **Splices** the chosen tool's `.atb` KV directly into the live cache.
+4. **Recomputes a short suffix** (~5%) so the spliced block is coherent with the surrounding
+   context, then decodes the first token.
+
+The expensive schema prefill never runs. That is the entire source of the speedup — and also
+the entire source of the mechanism's constraints, because a precompiled KV block is only valid
+under tight architectural and positional preconditions.
+
+## Why it matters
+
+For agentic workloads where every turn invokes a tool, prefill latency is a recurring tax on
+interactivity. Caching the *result* of prefill rather than recomputing it is the obvious move;
+the hard part is doing it correctly — KV state is position-dependent (RoPE) and
+architecture-dependent (attention layout). Nexus is an honest study of where that trade is
+real and where it breaks.
 
 ---
 
-## 2. Dual-Path Engine
+## Evidence status
 
-### Path A ($P \le 256$)
+All validated numbers come from a **single canonical tuple**, frozen 2026-06-20 under
+`results/v1.1_canonical/`:
 
-POSIX-mapped `.atb` splice + **5% suffix recompute** + FSM decode. KL mean **0.0076** @ P=256.
+| Dimension | Value |
+| --- | --- |
+| Model | Qwen2.5-14B-Instruct, Q4_K_M (`model_hash a09ea5e7`) |
+| Stack | `llama_cpp` / `llama.cpp` build `cb2463bb` |
+| Host | one Apple-Silicon machine |
+| Code | git `3ea7441`, current harness definitions |
 
-### Path B ($P > 256$)
+**Validated** (canonical artifacts under `results/v1.1_canonical/phaseH/`):
 
-Splice blocked (RoPE physics). Fallback:
+- **2.47× median true-TTFT speedup**, N1x vs B3, n=100 (H3).
+- **No detectable accuracy gap** at n=100 (H3).
+- **Anchored splice is output-exact** (H5 fidelity).
+- **Router scales to N≤100 tools under 5 µs** (H5 scalability).
 
-1. **Exact-token LCP radix cache** — zero-allocation LCRS tree (`node_arena_` + `token_arena_`), `llama_kv_cache_seq_cp` at **~3 µs** P50
-2. Text prefill via `decode_tokens`
+**Not validated:**
 
-**No FNV-1a chunking on the L0 hit path** — purged in Phase 3 DOD refactor.
+- Any second model or second host (all data is one tuple).
+- Portability beyond flash-attention-compatible, non-soft-capped architectures (see Scope).
+- Path B (deep-context, P>256) as an end-to-end accelerated path — it is wired but only ever
+  falls back to text prefill.
+- The 0.90 cross-encoder Recall@1 target — measured 0.88, not met.
 
-```python
-MAX_SPLICE_POS = 256  # nexus_agent.py
+**Retired** (do **not** cite as live evidence):
+
+- The tensor-KL boundary curve `0.0076 @P256` / `5.72 @P1024` — no tensor-KL harness exists;
+  see [internals](docs/internals.md).
+- Prior route-only headlines `171 ms` and `237.4 ms` — neither reproduces on the host.
+- The earlier n=30 "6-point accuracy gap" — small-n noise; gone at n=100.
+
+---
+
+## Headline result
+
+The headline is **true TTFT** — wall-clock to the first generated token, including first-token
+decode — measured serially, n=100 per arm:
+
+| Arm | What it is | Median true-TTFT |
+| --- | --- | --- |
+| **N1x** (Path A) | retrieve → gate → ATB splice → 5% suffix recompute | **457.5 ms** |
+| **B3** (B_RP) | retrieve → full text prefill of the schema | **1131.4 ms** |
+
+- **Speedup: 2.47×**, 95% CI **[2.41, 2.72]**.
+- **Accuracy delta (N1x − B3): −0.010**, 95% CI **[−0.080, +0.050]**; McNemar not significant.
+  This is "no detectable gap at n=100" — *not* a claim of equal accuracy.
+
+Artifact: [`h3_e2e_n100.json`](results/v1.1_canonical/phaseH/h3_e2e_n100.json).
+
+> **Route-only is not TTFT.** A separate gateway benchmark times retrieval + gate + splice with
+> `decode_us = 0` and reports **160.2 ms** (n=500). That is *route-only latency*, useful for
+> profiling the routing path, and it is never the headline. TTFT is always the H3 number above.
+
+### Compact benchmark summary
+
+| Metric | Value | Kind | Artifact |
+| --- | --- | --- | --- |
+| True-TTFT speedup (N1x vs B3) | 2.47× [2.41, 2.72], n=100 | true TTFT | `phaseH/h3_e2e_n100.json` |
+| Accuracy delta (N1x − B3) | −0.010 [−0.080, +0.050] | accuracy | `phaseH/h3_e2e_n100.json` |
+| Gateway routing+splice P50 | 160.2 ms, n=500 | **route-only** | canonical manifest |
+| Dense Recall@1 | 0.87 | retrieval | `phaseH/recall_miss_analysis_H4.json` |
+| CE-gated Recall@1 (~20% fire) | 0.88 (target 0.90 not met) | retrieval | `phaseH/recall_miss_analysis_H4.json` |
+| Anchored splice fidelity | logit-KL 0.0, top-1 1.0, n=50 | fidelity | `phaseH/splice_fidelity_anchored_H5.json` |
+| SLB scan P50 @ N=100 | 3.71 µs (<5 µs at N≤100) | router cost | `phaseH/slb_scalability_H5.csv` |
+| L0 warm-cache copy P50 | ~3.06 µs, 69.5% hit | cache | canonical manifest |
+
+---
+
+## Architecture in one screen
+
+```
+query ──► SLB dense router (INT8 SIMD) ──► margin gate ──► [confident?] ──► auto-route
+                                              │                              │
+                                              └─ uncertain ─► CE rerank ─────┤
+                                                                             ▼
+                                            n_past ≤ 256 ?  ──yes──► Path A: splice .atb KV
+                                                  │                          + 5% suffix recompute
+                                                  └──no───► Path B: decline → text prefill (fallback)
+                                                                             ▼
+                                                                       first token
 ```
 
----
+- **Dual-path gate.** Path A (the accelerated path) is taken only when the live context is
+  short enough (`n_past ≤ MAX_SPLICE_POS = 256`) that a precompiled KV block can be spliced
+  without unacceptable RoPE position drift. Beyond that, Nexus declines and falls back to
+  ordinary text prefill (Path B).
+- **Anchored splice.** A `.atb` compiled at the same base position it is injected at
+  (`Δpos = 0`) is **output-exact**. Off-anchor (isolated) splices degrade. Path A relies on
+  the anchored regime.
+- **Calibrated routing.** A P20 margin threshold (`τ ≈ 0.01365`) fires the cross-encoder on
+  roughly the least-confident 20% of decisions; the rest auto-route from the dense router alone.
 
-## 3. Production Pipeline
-
-```
-User Query
-  → Hybrid Dense Retrieval (< 5 µs)
-  → Transient Intent Signatures (dense/CE only)
-  → P20 Margin Gate → CE v3 Rerank (~20% fire rate)
-  → P ≤ 256? → KV Splice + 5% Suffix | L0 LCP Radix / Text Prefill
-  → FSM Logit-Masked Decode → GBNF Args
-```
-
-| Method | Recall@1 |
-|--------|----------|
-| Dense hybrid | **0.87** |
-| CE v3 (P20 gated) | **0.90** |
-
-Source: [`results/recall_miss_analysis_v2.json`](results/recall_miss_analysis_v2.json)
-
-P20 threshold **0.01365** in [`src/nexus_calibration.py`](src/nexus_calibration.py). The 0.15 static clamp is audit-only — dropped from routing.
+Full design: [docs/architecture.md](docs/architecture.md). Implementation truth:
+[docs/internals.md](docs/internals.md).
 
 ---
 
-## 4. What We Do Not Ship
+## Scope, limitations, non-goals
 
-| Feature | Evidence |
-|---------|----------|
-| ColBERT MaxSim | P50 **709 µs**, Recall@1 **0.72** — [`bench_phase22_maxsim.json`](results/bench_phase22_maxsim.json) |
-| LegoLink @ P=1024 | KL **5.72** — [`g4_gate_verdict.json`](results/g4_gate_verdict.json) |
-| Blockmask N1m orchestrator | E2E accuracy **0.0** — [`bench_n1m_fidelity_blockmask.json`](results/bench_n1m_fidelity_blockmask.json) |
-| FNV-1a 32-token chunking | 0% L0 hit rate — replaced by exact-token LCP radix |
-| P>256 ATB splice | RoPE boundary — orchestrator enforced |
+**Architectural precondition (hard).** The splice path requires a
+**flash-attention-compatible, non-soft-capped** attention architecture. Concretely: Gemma2
+uses attention logit soft-capping, which forces flash attention *off* on the pinned stack,
+which leaves the V cache transposed (`v_trans = true`), which the splicer rejects. The splice
+cannot even execute on Gemma2 — this is a structural block, not a tuning gap. **Qwen2.5 is the
+only validated working configuration.** Nexus Path A is *not* transformer-general.
 
----
+**One tuple.** Every validated number is one model, one host, one stack. No portability across
+models or hardware is claimed.
 
-## 5. Canonical Benchmark Artifacts
+**Path B is a fallback, not an accelerator.** Deep-context turns (P>256) decline the splice and
+text-prefill. The L0 warm tier is *probed* there for measurement only; it is not consumed.
 
-Only these files live in `results/` (see [`results/README.md`](results/README.md)):
+**Routing accuracy is ceiling-bound.** CE-gated Recall@1 is 0.88; the 0.90 target was not
+reachable by gate tuning alone (H4).
 
-| File | Proves |
-|------|--------|
-| `bench_gateway_e2e_v2.json` | **171 ms** / **0.91** |
-| `bench_e2e_v2.json` | B1 **9.48 s**, B3 **1.33 s** |
-| `bench_e2e.json` | N1 **466 ms**, 2.8× vs B3 |
-| `bench_phase28_radix_prefix_v2.json` | L0 **~3 µs** copy |
-| `recall_miss_analysis_v2.json` | M3 CE gate |
-| `margin_calibration_p20.json` | P20 audit trail |
-| `g4_gate_verdict.json` | G4 physics FAIL |
-| `bench_phase22_maxsim.json` | ColBERT graveyard |
-| `bench_n1m_fidelity_blockmask.json` | Blockmask graveyard |
-| `bench_phase21_ttft_real.json` | TTFT decomposition |
+**Non-goals.** Nexus is not a production gateway, not a general KV-cache library, and not a
+serving framework. It is a prototype that isolates and measures one specific latency trade.
 
 ---
 
-## 6. Build
+## Repo map
 
-```bash
-git submodule update --init --recursive
-pip install -r requirements.txt && pip install nanobind
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-export PYTHONPATH="$(pwd)/build:$(pwd)/src"
+| Path | What lives there |
+| --- | --- |
+| `src/nexus_orchestrator.{cpp,hpp}` | `route_and_splice`: routing, gate, dual-path decision |
+| `src/nexus_kv_splicer.{cpp,hpp}` | `inject_tool_page_raw`: low-level KV splice, `v_trans` check |
+| `src/nexus_slb.{cpp,hpp}` | Semantic Load Balancer — INT8 SIMD dense router |
+| `src/nexus_seq_warm_cache.{cpp,hpp}` | L0 warm prefix cache (`NexusRadixPrefixCache`) |
+| `src/nexus_rope_math.{cpp,hpp}` | RoPE reanchor kernels for off-anchor splices |
+| `src/aeon_tool_block.hpp` | `.atb` 128-byte header ABI |
+| `src/nexus_agent.py` | Python FFI, RAII splice context, routing processor |
+| `src/bindings.cpp` | nanobind bindings (`nexus_fsm_ext`) |
+| `docs/architecture.md` | system design and dataflow |
+| `docs/internals.md` | implementation invariants, ABI, artifact provenance |
+| `results/v1.1_canonical/` | frozen canonical evidence (manifest is source of truth) |
+| `results/v1.1_canonical/phaseH/` | H1/H3/H4/H5 reviews + primary JSON/CSV artifacts |
 
-# Calibrate P20 margin gate
-python3 scripts/calibrate_margin_threshold.py
+## Reproduction orientation
 
-# Train CE v3 (required for gateway/recall benches)
-python3 scripts/train_cross_encoder.py --output results/tool_cross_encoder_finetuned_v3
-```
+Benchmarks run only against the pinned stack and model on the canonical host:
 
-| Target | Description |
-|--------|-------------|
-| `nexus_fsm_ext` | Python extension |
-| `nexus_kv_compiler` | Offline `.atb` compiler |
-| `bench_phase28_radix_prefix` | L0 radix microbench |
-| `bench_phase22_concurrent_hazard` | Block cache hazard test |
+- Use the project venv: `.venv/bin/python` (system `python3` cannot import `llama_cpp`).
+- Set `PYTHONPATH=build:src:test`.
+- Run end-to-end (e2e) benchmarks **serially** — concurrent runs load the 14B model twice and
+  inflate absolutes.
+- The canonical manifest (`results/v1.1_canonical/CANONICAL_RESULTS_MANIFEST.json`) is the
+  authority on which artifacts are live; superseded files carry `_deprecation` stamps and
+  pristine copies live in `results/_quarantine_2026-06-20/`.
 
----
-
-## 7. Quick Start
-
-```python
-from nexus_agent import NexusAgent
-from nexus_retrieval import CrossEncoderReranker
-
-agent = NexusAgent(
-    llm=llm, embedding_llm=embed_llm, dim=768,
-    max_splice_pos=256,
-    # rerank_margin=None → loads CALIBRATED_MARGIN_THRESHOLD from nexus_calibration.py
-)
-agent.configure_reranker(cross_encoder=CrossEncoderReranker(
-    "results/tool_cross_encoder_finetuned_v3"
-))
-
-with agent.splice_context(query, seq_id=0) as ctx:
-    resolved_id, tool_name, args_json = agent.generate_with_tool(query, seq_id=0)
-```
+See [docs/internals.md](docs/internals.md) for full provenance and the artifact taxonomy.
 
 ---
 
-## 8. Citation
+## What we claim — and what we do not
 
-> Gateway TTFT P50 **171 ms**, tool-hit **0.91**, vs B3 **1.33 s** (~**7.8×**), n=100, Qwen2.5-14B-Instruct Q4_K_M, git `1384a33b`.
+**We claim:**
 
-Do not cite the 153× strawman or deep-context splice at $P \ge 1024$.
+- On the canonical tuple, Path A reaches first token **2.47×** faster than full-prefill B3
+  (n=100, CI-backed).
+- At n=100 there is **no detectable accuracy gap** between the two.
+- Anchored splices are **output-exact**; the router is **cheap** (<5 µs at N≤100).
+
+**We do not claim:**
+
+- That this generalizes to other models, hosts, or attention architectures.
+- That accuracy is *equal* (we claim no *detectable* gap at this sample size).
+- That route-only latency (160.2 ms) is TTFT.
+- The retired boundary curve, the old route-only headlines, or the n=30 accuracy gap.

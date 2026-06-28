@@ -13,18 +13,51 @@
   "metrics": {
     "hit_rate": {
       "unit": "ratio",
-      "raw_samples": [0.66],
-      "summary": {"mean":0.66,"std":0,"p50":0.66,"p90":0.66,"p99":0.66,"n":1}
+      "raw_samples": [
+        0.66
+      ],
+      "summary": {
+        "mean": 0.66,
+        "std": 0,
+        "p50": 0.66,
+        "p90": 0.66,
+        "p99": 0.66,
+        "n": 1
+      }
     },
     "copy_p50_us": {
       "unit": "us",
-      "raw_samples": [3.042],
-      "summary": {"mean":3.042,"std":0,"p50":3.042,"p90":3.042,"p99":3.042,"n":1}
+      "raw_samples": [
+        3.042
+      ],
+      "summary": {
+        "mean": 3.042,
+        "std": 0,
+        "p50": 3.042,
+        "p90": 3.042,
+        "p99": 3.042,
+        "n": 1
+      }
     },
     "copy_p99_us": {
       "unit": "us",
-      "raw_samples": [8.75],
-      "summary": {"mean":8.75,"std":0,"p50":8.75,"p90":8.75,"p99":8.75,"n":1}
+      "raw_samples": [
+        8.75
+      ],
+      "summary": {
+        "mean": 8.75,
+        "std": 0,
+        "p50": 8.75,
+        "p90": 8.75,
+        "p99": 8.75,
+        "n": 1
+      }
     }
+  },
+  "_deprecation": {
+    "status": "SUPERSEDED_BY_v1.1_canonical",
+    "date": "2026-06-20",
+    "note": "SUPERSEDED by results/v1.1_canonical/raw/l0_seed_[0-9].json (2026-06-20). This is an n=1 sample (66% hit). Canonical 10-seed: hit 69.5% (58-80%), copy_p50 median 3.06 us.",
+    "pristine_copy": "results/_quarantine_2026-06-20/bench_phase28_radix_prefix_v2.json.orig"
   }
 }

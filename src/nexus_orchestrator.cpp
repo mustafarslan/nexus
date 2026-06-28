@@ -67,7 +67,27 @@ uint32_t NexusOrchestrator::route_and_splice(const std::vector<int32_t>& user_qu
     }
 
     if (n_past > max_splice_pos_) {
+        // Path B (deep prefix): RoPE Δθ blocks the offline .atb splice, so the
+        // orchestrator declines and Python falls back to text prefill.
+        // F0 (read-only): probe the position-safe L0 prefix tier for measurement
+        // ONLY. We deliberately do NOT seq_cp/consume the match and do NOT alter
+        // the text-prefill fallback this phase — whether a deep-path L0 hit saves
+        // real work is unproven, and the warm pool is not populated on the deep
+        // path (no write-back), so full hits are expected to be rare. try_copy_to
+        // (tool-schema warm copy) stays disabled here: it would reintroduce the
+        // same Δθ drift the gate exists to prevent.
         splice_guard_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+        deep_path_entered_.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t deep_best_end =
+            prefix_tokens.empty() ? 0u : seq_warm_cache_.probe_prefix(prefix_tokens);
+        last_deep_n_past_.store(n_past, std::memory_order_relaxed);
+        last_deep_best_end_.store(deep_best_end, std::memory_order_relaxed);
+        if (deep_best_end >= n_past) {
+            deep_path_l0_hit_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            deep_path_l0_miss_.fetch_add(1, std::memory_order_relaxed);
+        }
+        deep_path_text_fallback_.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
 

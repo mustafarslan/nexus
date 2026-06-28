@@ -48,6 +48,27 @@ private:
     uint32_t max_splice_pos_;
     std::atomic<uint64_t> splice_guard_fallback_count_{0};
 
+    // F0 deep-path (P > max_splice_pos_) instrumentation. Read-only probe this phase:
+    //   deep_path_entered_       = deep path taken (RoPE blocks .atb splice)
+    //   deep_path_l0_hit_        = probe found a position-safe FULL prefix match (>= n_past)
+    //                              NOTE: opportunity only — NOT consumed this phase
+    //   deep_path_l0_miss_       = no usable full-prefix match
+    //   deep_path_text_fallback_ = Python text-prefill still executed (this phase: always)
+    // Invariants: entered == l0_hit + l0_miss; text_fallback == entered (F0).
+    std::atomic<uint64_t> deep_path_entered_{0};
+    std::atomic<uint64_t> deep_path_l0_hit_{0};
+    std::atomic<uint64_t> deep_path_l0_miss_{0};
+    std::atomic<uint64_t> deep_path_text_fallback_{0};
+
+    // F0/Phase2: raw best_end recording (read-only). Last deep-call (n_past, best_end)
+    // so a measurement harness can log per-call pairs and build the best_end histogram /
+    // r=best_end/n_past CDF offline. NOTE (code-derived): the pool is populated only on
+    // Path A (update_from_seq, n_past<=256), so best_end is structurally capped at <=256
+    // for deep requests — full deep matches are expected to be ~0. This is measurement
+    // only; no consume, no population change.
+    std::atomic<uint32_t> last_deep_n_past_{0};
+    std::atomic<uint32_t> last_deep_best_end_{0};
+
     struct alignas(NEXUS_CACHE_LINE) HazardShard {
         std::mutex mutex;
         std::unordered_map<llama_seq_id, HazardGuard> guards;
@@ -80,6 +101,15 @@ public:
     void pin_block_tool(uint32_t tool_id) { if (block_cache_) block_cache_->pin_tool(tool_id); }
     uint64_t get_splice_guard_fallback_count() const { return splice_guard_fallback_count_.load(std::memory_order_relaxed); }
     uint32_t get_max_splice_pos() const { return max_splice_pos_; }
+
+    // F0 deep-path counters (read-only probe instrumentation; see member declarations).
+    uint64_t get_deep_path_entered() const { return deep_path_entered_.load(std::memory_order_relaxed); }
+    uint64_t get_deep_path_l0_hit() const { return deep_path_l0_hit_.load(std::memory_order_relaxed); }
+    uint64_t get_deep_path_l0_miss() const { return deep_path_l0_miss_.load(std::memory_order_relaxed); }
+    uint64_t get_deep_path_text_fallback() const { return deep_path_text_fallback_.load(std::memory_order_relaxed); }
+    // Raw best_end recording (read-only). Harness reads after each deep route call.
+    uint32_t get_last_deep_n_past() const { return last_deep_n_past_.load(std::memory_order_relaxed); }
+    uint32_t get_last_deep_best_end() const { return last_deep_best_end_.load(std::memory_order_relaxed); }
 
     uint32_t route_and_splice(const std::vector<int32_t>& user_query_tokens,
                               const std::vector<float>& query_embedding,

@@ -153,5 +153,11 @@
     "b3_accuracy": 0.91,
     "n1_accuracy": 0.86,
     "speedup_n1_vs_b3": 2.83
+  },
+  "_deprecation": {
+    "status": "SUPERSEDED_BY_v1.1_canonical",
+    "date": "2026-06-20",
+    "note": "SUPERSEDED + INTERNALLY INCONSISTENT (B3 ttft_us_p50 vs ci.point mismatch). Replaced by results/v1.1_canonical/raw/e2e_n25.json.",
+    "pristine_copy": "results/_quarantine_2026-06-20/bench_e2e.json.orig"
   }
 }

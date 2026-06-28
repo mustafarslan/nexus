@@ -153,5 +153,11 @@
     "b3_accuracy": 0.91,
     "n1_accuracy": 0.85,
     "speedup_n1_vs_b3": 2.76
+  },
+  "_deprecation": {
+    "status": "SUPERSEDED_BY_v1.1_canonical",
+    "date": "2026-06-20",
+    "note": "SUPERSEDED by results/v1.1_canonical/ (2026-06-20). Run-A baselines (B3 1.33 s, B1 9.48 s); docs print paper Run-B values (B3 1.50 s, B1 12.35 s) while citing this file.",
+    "pristine_copy": "results/_quarantine_2026-06-20/bench_e2e_v2.json.orig"
   }
 }

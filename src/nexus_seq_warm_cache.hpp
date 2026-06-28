@@ -55,6 +55,12 @@ public:
                              llama_seq_id dst_seq);
     bool try_copy_to(llama_context* ctx, uint32_t tool_id, uint32_t n_past, llama_seq_id dst_seq);
 
+    // F0 deep-path probe: read-only. Returns the number of position-safe prefix
+    // positions that try_copy_prefix WOULD copy (0 = miss), WITHOUT performing the
+    // seq_cp or touching LRU/ref_count. Used to measure deep-path L0 reachability
+    // without mutating KV state or the fallback path.
+    uint32_t probe_prefix(std::span<const int32_t> prefix_tokens) const;
+
     void update_from_seq(llama_context* ctx, std::span<const int32_t> prefix_tokens, uint32_t end_pos,
                          llama_seq_id src_seq, uint32_t tool_id = 0);
     void update_warm_from_seq(llama_context* ctx, uint32_t tool_id, uint32_t n_past, uint32_t schema_len,
@@ -69,7 +75,11 @@ public:
 private:
     static uint64_t steady_tick() noexcept;
 
-    uint32_t find_child(uint32_t parent_idx, int32_t first_token);
+    uint32_t find_child(uint32_t parent_idx, int32_t first_token) const;
+    // Shared LCP matcher. Caller MUST hold a (shared) lock on trie_rw_lock_.
+    // Returns best_end (positions matched, 0 = miss) and sets out_best_pool.
+    // Pure reads only — used by both try_copy_prefix (Path A) and probe_prefix (Path B).
+    uint32_t match_prefix_locked(std::span<const int32_t> prefix_tokens, uint32_t& out_best_pool) const;
     uint32_t alloc_node();
     uint32_t append_tokens(std::span<const int32_t> tokens);
     size_t acquire_pool_slot();

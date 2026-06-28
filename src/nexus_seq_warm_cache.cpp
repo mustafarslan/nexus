@@ -42,7 +42,7 @@ void NexusRadixPrefixCache::clear_pins() {
     pinned_tools_.clear();
 }
 
-uint32_t NexusRadixPrefixCache::find_child(uint32_t parent_idx, int32_t first_token) {
+uint32_t NexusRadixPrefixCache::find_child(uint32_t parent_idx, int32_t first_token) const {
     if (parent_idx >= node_arena_.size()) {
         return UINT32_MAX;
     }
@@ -79,6 +79,23 @@ uint32_t NexusRadixPrefixCache::try_copy_prefix(llama_context* ctx, std::span<co
 
     std::shared_lock<std::shared_mutex> lock(trie_rw_lock_);
 
+    uint32_t best_pool = UINT32_MAX;
+    const uint32_t best_end = match_prefix_locked(prefix_tokens, best_pool);
+    if (best_pool == UINT32_MAX || best_end == 0) {
+        return 0;
+    }
+
+    const PoolSlotMeta& slot = pool_meta_[best_pool];
+    llama_kv_cache_seq_cp(ctx, slot.seq_id, dst_seq, 0, static_cast<llama_pos>(best_end));
+
+    const uint64_t now = steady_tick();
+    pool_meta_[best_pool].last_access_tick.store(now, std::memory_order_relaxed);
+    pool_meta_[best_pool].ref_count.fetch_add(1, std::memory_order_relaxed);
+    return best_end;
+}
+
+uint32_t NexusRadixPrefixCache::match_prefix_locked(std::span<const int32_t> prefix_tokens,
+                                                    uint32_t& out_best_pool) const {
     uint32_t curr = 0;
     size_t off = 0;
     uint32_t best_pool = UINT32_MAX;
@@ -125,16 +142,20 @@ uint32_t NexusRadixPrefixCache::try_copy_prefix(llama_context* ctx, std::span<co
         }
     }
 
-    if (best_pool == UINT32_MAX || best_end == 0) {
+    out_best_pool = best_pool;
+    return best_end;
+}
+
+uint32_t NexusRadixPrefixCache::probe_prefix(std::span<const int32_t> prefix_tokens) const {
+    if (prefix_tokens.empty()) {
         return 0;
     }
-
-    const PoolSlotMeta& slot = pool_meta_[best_pool];
-    llama_kv_cache_seq_cp(ctx, slot.seq_id, dst_seq, 0, static_cast<llama_pos>(best_end));
-
-    const uint64_t now = steady_tick();
-    pool_meta_[best_pool].last_access_tick.store(now, std::memory_order_relaxed);
-    pool_meta_[best_pool].ref_count.fetch_add(1, std::memory_order_relaxed);
+    std::shared_lock<std::shared_mutex> lock(trie_rw_lock_);
+    uint32_t best_pool = UINT32_MAX;
+    const uint32_t best_end = match_prefix_locked(prefix_tokens, best_pool);
+    if (best_pool == UINT32_MAX) {
+        return 0;
+    }
     return best_end;
 }
 
