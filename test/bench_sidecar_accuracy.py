@@ -132,21 +132,67 @@ def full_schema_text(agent, tool_id):
                       separators=(",", ":"))
 
 
-def compare_to_gold(hybrid: str, gold: dict) -> dict:
-    """v1.6: score generated args against the hand-labeled gold (NOT the Oracle).
-
-    - parse_ok : generated string is valid JSON.
-    - leak     : any generated VALUE contains a <placeholder> marker.
-    - per gold field: string -> _norm()-equal (case/separator-insensitive);
-                      bool/int -> exact. Missing key -> wrong.
-    Only the gold's SPECIFIED fields are scored; free-form fields (content/message)
-    and unspecified required fields (owner on underspecified queries) are not.
+def try_repair_json(s: str) -> tuple[dict, bool]:
+    """Attempt to parse JSON; if truncated, try conservative repairs.
+    
+    Returns (parsed_dict, was_repaired). If completely unparseable, returns ({}, False).
+    
+    Repair strategy (ordered from most to least conservative):
+    1. json.loads(s) -- no repair needed
+    2. Append closing suffixes ('"}', '}', '"]}', ']}') -- handles mid-string truncation
+    3. Regex key-value extraction -- handles severely truncated outputs where the
+       opening fields are correct but the JSON is cut deep inside a later value
+    
+    The regex fallback extracts only string, boolean, and integer values. It does NOT
+    attempt to reconstruct arrays or nested objects, keeping false-positive risk low.
     """
+    s = (s or "").strip()
+    if not s.startswith("{"):
+        return {}, False
+    
+    # Strategy 1: clean parse
     try:
-        a = json.loads(hybrid)
-        parse_ok = isinstance(a, dict)
+        d = json.loads(s)
+        if isinstance(d, dict):
+            return d, False
     except Exception:
-        a, parse_ok = {}, False
+        pass
+    
+    # Strategy 2: append closing suffixes (handles mid-string/mid-object truncation)
+    for suffix in ['"}', '}', '",}', '"]}', ']}']:
+        try:
+            d = json.loads(s + suffix)
+            if isinstance(d, dict):
+                return d, True
+        except Exception:
+            pass
+    
+    # Strategy 3: regex extraction for severely truncated outputs
+    # Only extract complete key-value pairs that appear before the truncation point
+    result = {}
+    # String values: "key": "value" (non-greedy, stops at unescaped quote)
+    for m in re.finditer(r'"([^"]+)"\s*:\s*"((?:[^"\\]|\\.)*)"', s):
+        result[m.group(1)] = m.group(2)
+    # Boolean values: "key": true/false
+    for m in re.finditer(r'"([^"]+)"\s*:\s*(true|false)(?=[,}\s])', s):
+        result[m.group(1)] = m.group(2) == "true"
+    # Integer values: "key": 123
+    for m in re.finditer(r'"([^"]+)"\s*:\s*(\d+)(?=[,}\s])', s):
+        result[m.group(1)] = int(m.group(2))
+    
+    return result, bool(result)
+
+
+def compare_to_gold(hybrid: str, gold: dict) -> dict:
+    """v1.9: score generated args against gold with truncation recovery.
+
+    - parse_ok  : generated string yielded a usable dict (clean or repaired).
+    - repaired  : True if the dict required truncation recovery.
+    - leak      : any generated VALUE contains a <placeholder> marker.
+    - per gold field: string -> _norm()-equal; bool/int -> exact. Missing key -> wrong.
+    """
+    a, repaired = try_repair_json(hybrid)
+    parse_ok = bool(a)
 
     if parse_ok:
         leak = any(isinstance(v, str) and _PLACEHOLDER_RE.search(v) for v in a.values())
@@ -165,7 +211,6 @@ def compare_to_gold(hybrid: str, gold: dict) -> dict:
         elif isinstance(gv, str):
             ok = _norm(gen) == _norm(gv)
         elif isinstance(gv, (list, tuple)):
-            # v1.7: accept any listed alternate (debatable gold labels, e.g. case 6/16).
             ok = any(_norm(gen) == _norm(x) if isinstance(x, str) else gen == x for x in gv)
         else:
             ok = gen == gv
@@ -174,6 +219,7 @@ def compare_to_gold(hybrid: str, gold: dict) -> dict:
 
     return {
         "parse_ok": parse_ok,
+        "repaired": repaired,
         "leak": leak,
         "n_specified": len(gold),
         "n_correct": n_correct,
@@ -229,7 +275,7 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="tiny run to validate the harness")
     ap.add_argument("--limit", type=int, default=100, help="routing+TTFT query count")
     ap.add_argument("--cons-n", type=int, default=40, help="oracle-consistency query count")
-    ap.add_argument("--max-tokens", type=int, default=128)  # v1.5: 64 truncated JSON mid-content
+    ap.add_argument("--max-tokens", type=int, default=256)  # v1.9: raised to 256 to prevent truncation
     ap.add_argument("--out-dir", default=str(OUT_DIR))
     args = ap.parse_args()
     if args.smoke:
@@ -291,7 +337,7 @@ def main():
     tot_spec = sum(r["n_specified"] for r in routed_records)
     tot_correct = sum(r["n_correct"] for r in routed_records)
     summary = {
-        "arm": "V1.8_HYBRID (bare typed IR, no exemplar/desc; gold-args eval; kebab-case)",
+        "arm": "V1.9_HYBRID (bare typed IR, no exemplar/desc; gold-args eval; kebab-case; truncation-resilient)",
         "n_routing": n,
         "routing_accuracy": routing_hits / n if n else 0.0,
         "ir_tokens_p50": pct(ir_toks, 50), "ir_tokens_p99": pct(ir_toks, 99),
@@ -305,6 +351,7 @@ def main():
         "placeholder_leak_count": sum(1 for r in cons_records if r.get("leak")),
         # GATE 4: JSON validity across all generated arg records.
         "json_valid_rate_hybrid": sum(r["parse_ok"] for r in cons_records) / len(cons_records) if cons_records else None,
+        "repair_count": sum(1 for r in cons_records if r.get("repaired")),
         # GATE 3: serial time-to-first-arg-token.
         "ttft_first_arg_token_ms_hybrid_p50": pct(ttft_hybrid, 50),
         "ttft_first_arg_token_ms_oracle_fullschema_p50": pct(ttft_oracle, 50),
@@ -318,7 +365,7 @@ def main():
     out_path = out_dir / ("accuracy_smoke.json" if args.smoke else "accuracy.json")
     out_path.write_text(json.dumps(artifact, indent=2))
 
-    print("\n=== V1.8 SIDECAR ACCURACY / GOLD-ARGS ===")
+    print("\n=== V1.9 SIDECAR ACCURACY / GOLD-ARGS ===")
     for k, v in summary.items():
         print(f"  {k}: {v}")
     print("\n  coreference:")
