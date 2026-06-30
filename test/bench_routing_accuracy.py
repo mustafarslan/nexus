@@ -20,8 +20,6 @@ lib_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../build/exte
 os.environ["LLAMA_CPP_LIB_PATH"] = lib_dir
 os.environ["LLAMA_CPP_LIB"] = os.path.join(lib_dir, 'libllama.dylib')
 
-import llama_cpp
-import nexus_fsm_ext
 from benchmark_results import file_sha256, write_artifact
 
 DEFAULT_MODEL = "/Users/mustafarslan/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct-GGUF/snapshots/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf"
@@ -151,12 +149,15 @@ queries_dataset = [
 ]
 
 def load_first_10_tools():
+    return load_n_tools(10)
+
+def load_n_tools(n: int):
     json_path = "test/schemas/github_tools.json"
     with open(json_path, "r") as f:
         data = json.load(f)
     tools = data.get("tools", [])
     
-    selected_tools = []
+    # 10 core target tools in their exact original order
     names = [
         "create_or_update_file",
         "search_repositories",
@@ -169,36 +170,143 @@ def load_first_10_tools():
         "create_branch",
         "list_commits"
     ]
+    
+    selected_tools = []
     for idx, name in enumerate(names):
         tool = next(t for t in tools if t["name"] == name)
         tool_copy = tool.copy()
         tool_copy["id"] = idx + 1
         tool_copy["desc"] = tool_copy["description"]
         selected_tools.append(tool_copy)
+        
+    if n <= 10:
+        return selected_tools[:n]
+        
+    # Inject Semantic Blur tools at positions 11 and 12
+    blur_tools = [
+        {
+            "name": "create_or_update_file_metadata",
+            "description": "Create or update file metadata in a repository, such as custom headers, file attributes, labels, or version tags. Do NOT use for creating or editing file content.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "Owner of the repo"},
+                    "repo": {"type": "string", "description": "Repo name"},
+                    "path": {"type": "string", "description": "File path"},
+                    "metadata": {"type": "object", "description": "Metadata object"}
+                },
+                "required": ["owner", "repo", "path"]
+            }
+        },
+        {
+            "name": "get_repository_data",
+            "description": "Retrieve generic data, settings, properties, or stats from a repository. Do NOT use for downloading the text/code content of files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "Owner of the repo"},
+                    "repo": {"type": "string", "description": "Repo name"},
+                    "include_stats": {"type": "boolean", "description": "Include repository stats"}
+                },
+                "required": ["owner", "repo"]
+            }
+        }
+    ]
+    
+    added_names = set(names)
+    current_id = 11
+    
+    for bt in blur_tools:
+        bt_copy = bt.copy()
+        bt_copy["id"] = current_id
+        bt_copy["desc"] = bt_copy["description"]
+        selected_tools.append(bt_copy)
+        added_names.add(bt_copy["name"])
+        current_id += 1
+        if len(selected_tools) >= n:
+            return selected_tools
+            
+    # Load other tools from github_tools.json
+    for tool in tools:
+        if tool["name"] not in added_names:
+            tool_copy = tool.copy()
+            tool_copy["id"] = current_id
+            tool_copy["desc"] = tool_copy["description"]
+            selected_tools.append(tool_copy)
+            added_names.add(tool["name"])
+            current_id += 1
+            if len(selected_tools) >= n:
+                return selected_tools
+                
+    # Sample from test/schemas/bloat/ if needed
+    bloat_dir = Path("test/schemas/bloat")
+    if bloat_dir.exists() and len(selected_tools) < n:
+        bloat_files = sorted(list(bloat_dir.glob("*.json")))
+        for bf in bloat_files:
+            try:
+                with open(bf, "r") as f:
+                    tool_data = json.load(f)
+                name = tool_data.get("name")
+                if name not in added_names:
+                    tool_copy = tool_data.copy()
+                    tool_copy["id"] = current_id
+                    tool_copy["desc"] = tool_data.get("description", "")
+                    if "inputSchema" not in tool_copy and "input_schema" in tool_copy:
+                        tool_copy["inputSchema"] = tool_copy["input_schema"]
+                    selected_tools.append(tool_copy)
+                    added_names.add(name)
+                    current_id += 1
+                    if len(selected_tools) >= n:
+                        break
+            except Exception as e:
+                continue
+                
     return selected_tools
 
 def compile_atb_files(tools, model_path):
     os.makedirs("test/schemas/jit_bloat", exist_ok=True)
+    
+    # 1. Identify which tools need compilation
+    to_compile = []
     for tool in tools:
         name = tool["name"]
         json_path = f"test/schemas/jit_bloat/{name}.json"
         atb_path = f"test/schemas/jit_bloat/{name}.atb"
         
-        # Write schema to temp json file
-        schema_json = tool["inputSchema"] if "inputSchema" in tool else tool
-        # Wrap it in standard schema object structure expected by compiler
+        if os.path.exists(atb_path):
+            tool["atb_path"] = atb_path
+        else:
+            to_compile.append((tool, json_path, atb_path))
+            
+    if not to_compile:
+        return
+        
+    # 2. Write temp JSON files and prepare batch list
+    batch_lines = []
+    for tool, json_path, atb_path in to_compile:
+        schema_json = tool.get("inputSchema") or tool.get("input_schema") or tool
         wrapper = {"inputSchema": schema_json}
         with open(json_path, "w") as f:
             json.dump(wrapper, f)
-            
-        # Compile to atb
-        subprocess.run([
-            "./build/nexus_kv_compiler",
-            "--model", model_path,
-            "--schema", json_path,
-            "--output", atb_path
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        batch_lines.append(f"{json_path},{atb_path}\n")
+        
+    batch_list_path = "test/schemas/jit_bloat/batch_list.txt"
+    with open(batch_list_path, "w") as f:
+        f.writelines(batch_lines)
+        
+    # 3. Launch compiler once (GPU-enabled)
+    subprocess.run([
+        "./build/nexus_kv_compiler",
+        "--model", model_path,
+        "--batch-list", batch_list_path
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # 4. Update tools and clean up batch list
+    for tool, json_path, atb_path in to_compile:
         tool["atb_path"] = atb_path
+        
+    if os.path.exists(batch_list_path):
+        os.remove(batch_list_path)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Nexus routing accuracy benchmark")
@@ -209,21 +317,22 @@ def parse_args():
     parser.add_argument("--auto-route-margin", type=float, default=0.10)
     parser.add_argument("--speculative-threshold", type=float, default=0.0)
     parser.add_argument("--speculative-margin", type=float, default=0.0)
+    parser.add_argument("--tool-sizes", default="10", help="Space-separated list of tool registry sizes, e.g. '10 20 26'")
+    parser.add_argument("--runs", type=int, default=1, help="Number of trials per tool size")
     return parser.parse_args()
 
 def run_evaluation(args):
-    np.random.seed(args.seed)
-    print("======================================================================")
-    print("              NEXUS ROUTING ACCURACY COMPARATIVE BENCHMARK             ")
-    print("======================================================================")
+    sizes = [int(s) for s in args.tool_sizes.split()]
+    print(f"Pre-compiling all tools up to size {max(sizes)} on GPU...")
+    max_tools = load_n_tools(max(sizes))
+    compile_atb_files(max_tools, args.model)
+    print("Pre-compilation finished successfully.")
     
-    # 1. Load the 10 tools and compile them
-    tools = load_first_10_tools()
-    print(f"Loaded 10 complex tools. Compiling to ATB...")
-    compile_atb_files(tools, args.model)
-    print("ATB compilation complete.")
+    global llama_cpp, nexus_fsm_ext
+    import llama_cpp
+    import nexus_fsm_ext
     
-    # 2. Instantiate embedding model
+    # 1. Instantiate models once outside the loops
     print(f"Loading embedding model from {args.embed_model}...")
     llm_emb = llama_cpp.Llama(
         model_path=args.embed_model,
@@ -233,11 +342,10 @@ def run_evaluation(args):
     emb_dim = llm_emb.n_embd()
     print(f"Embedding model loaded. Dimension: {emb_dim}")
     
-    # 3. Instantiate LLM
     print(f"Loading Qwen model from {args.model}...")
     llm = llama_cpp.Llama(
         model_path=args.model,
-        n_ctx=8192,
+        n_ctx=32768,  # Qwen2.5 supports 32k; 8192 overflows once the all-schemas anchor (sys_len) grows past N>=50
         n_gpu_layers=999,
         logits_all=True,
         flash_attn=True,
@@ -246,73 +354,150 @@ def run_evaluation(args):
     ctx = llm._ctx.ctx
     print("Qwen model loaded successfully.")
 
-    # 4. Setup SLB & FSM
-    slb = nexus_fsm_ext.NexusSemanticSLB(emb_dim)
-    fsm = nexus_fsm_ext.NexusRadixFSM()
+    sizes = [int(s) for s in args.tool_sizes.split()]
+    runs = args.runs
     
-    # Register tools
-    for tool in tools:
-        tid = tool["id"]
-        tname = tool["name"]
-        tdesc = tool["desc"]
+    overall_summary = {}
+
+    print("======================================================================")
+    print("              NEXUS ROUTING ACCURACY COMPARATIVE BENCHMARK             ")
+    print("======================================================================")
+
+    for size in sizes:
+        print(f"\nEvaluating Registry Size N = {size} over {runs} runs...")
         
-        # Embed description
-        emb_raw = llm_emb.embed(tdesc)
-        emb = emb_raw[0] if (len(emb_raw) > 0 and isinstance(emb_raw[0], list)) else emb_raw
-        emb = np.array(emb, dtype=np.float32)
-        norm = np.linalg.norm(emb)
-        if norm > 0:
-            emb = emb / norm
+        runs_acc_a = []
+        runs_acc_b = []
+        runs_rec1 = []
+        runs_rec3 = []
+        runs_rec5 = []
+        runs_auto_route = []
+        runs_fsm_fallback = []
+        runs_latency_a = []
+        runs_latency_b = []
+        runs_latency_slb = []
+        runs_tokens_a = []
+        runs_tokens_b = []
         
-        # Register in FSM
-        route_tokens = [int(t) for t in llm.tokenize(tname.encode("utf-8"), add_bos=False, special=False)]
-        fsm.add_route(tid, route_tokens)
-        
-        # Register in SLB
-        digest_text = f"Tool Name: {tname}. Description: {tdesc}."
-        digest_tokens = [int(t) for t in llm.tokenize(digest_text.encode("utf-8"), add_bos=False, special=False)]
-        if len(digest_tokens) > 64:
-            digest_tokens = digest_tokens[:64]
-        slb.register_tool(tid, emb, digest_tokens)
-        
-    # 5. Initialize Orchestrator
-    orchestrator = nexus_fsm_ext.NexusOrchestrator(
-        ctx,
-        slb,
-        fsm,
-        base_pos=256,
-        speculative_threshold=args.speculative_threshold,
-        speculative_margin=args.speculative_margin,
-        auto_route_margin=args.auto_route_margin,
-    )
-    for tool in tools:
-        orchestrator.register_tool_path(tool["id"], tool["atb_path"])
-        
-    # Evaluate System Prompt context
-    system_prompt = "You are a helpful agent."
-    sys_tokens = llm.tokenize(f"<|im_start|>system\n{system_prompt}<|im_end|>\n".encode("utf-8"), add_bos=False, special=False)
-    sys_len = len(sys_tokens)
-    
-    # --- EVALUATE ---
-    hits_a = 0
-    hits_b = 0
-    auto_route_count = 0
-    fsm_fallback_count = 0
-    total = len(queries_dataset)
-    full_context_latencies_ms = []
-    nexus_latencies_ms = []
-    slb_latencies_ms = []
-    records = []
-    
-    print(f"\nRunning comparative benchmark over {total} synthetic queries...")
-    for idx, item in enumerate(queries_dataset):
-        query = item["query"]
-        target_tool = item["tool"]
-        
-        # (A) Scenario A: Standard Full-Context Schema Prefill
-        llm.eval(sys_tokens)
-        schemas_str = "\n".join([f"Tool {t['id']}: {t['name']}\nDescription: {t['desc']}" for t in tools])
-        prompt_a = f"""You are a tool routing agent. Select the single most appropriate tool name from the list below that matches the user's intent.
+        for run_idx in range(runs):
+            run_seed = args.seed + run_idx
+            np.random.seed(run_seed)
+            print(f"  Run {run_idx + 1}/{runs} (seed={run_seed})...")
+            llm.reset()
+            
+            # Load tools
+            tools = load_n_tools(size)
+            compile_atb_files(tools, args.model)
+            
+            # Setup SLB & FSM
+            slb = nexus_fsm_ext.NexusSemanticSLB(emb_dim)
+            fsm = nexus_fsm_ext.NexusRadixFSM()
+            
+            # Register tools
+            for tool in tools:
+                tid = tool["id"]
+                tname = tool["name"]
+                tdesc = tool["desc"]
+                
+                # Embed document: nomic-embed-v1.5 requires the "search_document:" task
+                # prefix, and the tool NAME carries dominant routing signal (probe: name+desc
+                # lifts R@1 40%->74%, R@3 70%->95% at N=250). Mirror this on the query side.
+                emb_raw = llm_emb.embed(f"search_document: {tname}: {tdesc}")
+                emb = emb_raw[0] if (len(emb_raw) > 0 and isinstance(emb_raw[0], list)) else emb_raw
+                emb = np.array(emb, dtype=np.float32)
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+                
+                # Register in FSM
+                route_tokens = [int(t) for t in llm.tokenize(tname.encode("utf-8"), add_bos=False, special=False)]
+                fsm.add_route(tid, route_tokens)
+                
+                # Register in SLB
+                digest_text = f"Tool Name: {tname}. Description: {tdesc}."
+                digest_tokens = [int(t) for t in llm.tokenize(digest_text.encode("utf-8"), add_bos=False, special=False)]
+                if len(digest_tokens) > 64:
+                    digest_tokens = digest_tokens[:64]
+                slb.register_tool(tid, emb, digest_tokens)
+                
+            # Initialize Orchestrator
+            orchestrator = nexus_fsm_ext.NexusOrchestrator(
+                ctx,
+                slb,
+                fsm,
+                base_pos=256,
+                speculative_threshold=args.speculative_threshold,
+                speculative_margin=args.speculative_margin,
+                auto_route_margin=args.auto_route_margin,
+            )
+            for tool in tools:
+                orchestrator.register_tool_path(tool["id"], tool["atb_path"])
+                
+            # System Prompt
+            system_prompt = "You are a helpful agent."
+            sys_tokens = llm.tokenize(f"<|im_start|>system\n{system_prompt}<|im_end|>\n".encode("utf-8"), add_bos=False, special=False)
+            sys_len = len(sys_tokens)
+            
+            # Calculate raw schema tokens for Scenario A (Oracle)
+            # Scenario A prompt contains all JSON schemas
+            schemas_str = "\n".join([f"Tool {t['id']}: {t['name']}\nDescription: {t['desc']}" for t in tools])
+            schemas_tokens = llm.tokenize(schemas_str.encode("utf-8"), add_bos=False, special=False)
+            
+            hits_a = 0
+            hits_b = 0
+            top1_recall_hits = 0
+            top3_recall_hits = 0
+            top5_recall_hits = 0
+            auto_route_count = 0
+            fsm_fallback_count = 0
+            total = len(queries_dataset)
+            
+            lat_a = []
+            lat_b = []
+            lat_slb = []
+            tokens_a_list = []
+            tokens_b_list = []
+            
+            for idx, item in enumerate(queries_dataset):
+                query = item["query"]
+                target_tool = item["tool"]
+                target_id = next((t["id"] for t in tools if t["name"] == target_tool), -1)
+                
+                # Check if target_tool is even in the active registry for this size
+                # if not, skip this query for accurate metrics
+                if target_id == -1:
+                    total -= 1
+                    continue
+                
+                query_tokens = llm.tokenize(query.encode("utf-8"), add_bos=False, special=False)
+                
+                # Token counts
+                # Oracle: sys + schemas + query + prompt overhead
+                tokens_a = sys_len + len(schemas_tokens) + len(query_tokens) + 50  # 50 approx formatting tokens
+                tokens_a_list.append(tokens_a)
+                
+                # Nexus selected tool IR token count
+                # Find matching target tool to compute its IR representation
+                # Using a fallback length of 20 tokens if name doesn't match
+                selected_tool_dict = next((t for t in tools if t["id"] == target_id), None)
+                ir_len = 20
+                if selected_tool_dict:
+                    # Form signature IR
+                    name = selected_tool_dict.get("name")
+                    schema = selected_tool_dict.get("inputSchema") or selected_tool_dict.get("input_schema") or {}
+                    props = schema.get("properties", {}) or {}
+                    params = ", ".join(f"{p}: string" for p in props)
+                    sig = f"{name}({params})"
+                    ir_len = len(llm.tokenize(sig.encode("utf-8"), add_bos=False, special=False))
+                    
+                # Nexus: sys + query + selected tool IR
+                tokens_b = sys_len + len(query_tokens) + ir_len + 15
+                tokens_b_list.append(tokens_b)
+                
+                # (A) Scenario A
+                if tokens_a < 7500:
+                    llm.eval(sys_tokens)
+                    prompt_a = f"""You are a tool routing agent. Select the single most appropriate tool name from the list below that matches the user's intent.
 You MUST output ONLY the name of the tool, with no other text, punctuation, explanation, or markdown.
 
 Available Tools:
@@ -320,102 +505,177 @@ Available Tools:
 
 Query: {query}
 Selected Tool Name:"""
-        
-        t0 = time.perf_counter()
-        res_a = llm.create_completion(
-            prompt=prompt_a,
-            max_tokens=15,
-            temperature=0.0
-        )
-        full_context_latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-        pred_a = res_a["choices"][0]["text"].strip()
-        # Make comparison robust: check if target_tool is a clean substring or exact match
-        is_hit_a = (target_tool in pred_a) or (pred_a in target_tool) or (pred_a.replace("`", "") == target_tool)
-        if is_hit_a:
-            hits_a += 1
-            
-        # Reset KV Cache for LLM
-        llm.reset()
-        
-        # (B) Scenario B: Nexus SLB scan + FSM masking
-        # Evaluate System Prompt once
-        llm.eval(sys_tokens)
-        query_tokens = [int(t) for t in llm.tokenize(query.encode("utf-8"), add_bos=False, special=False)]
-        
-        # Embed query
-        query_emb_raw = llm_emb.embed(query)
-        query_emb = query_emb_raw[0] if (len(query_emb_raw) > 0 and isinstance(query_emb_raw[0], list)) else query_emb_raw
-        query_emb = np.array(query_emb, dtype=np.float32)
-        q_norm = np.linalg.norm(query_emb)
-        if q_norm > 0:
-            query_emb = query_emb / q_norm
-        
-        # Track path distribution
-        t_slb0 = time.perf_counter()
-        matches = slb.search(query_emb, 3)
-        slb_latencies_ms.append((time.perf_counter() - t_slb0) * 1000.0)
-        is_auto_route = False
-        if len(matches) >= 2:
-            is_auto_route = (matches[0].score - matches[1].score) >= 0.10
-        elif len(matches) > 0:
-            is_auto_route = True
-            
-        if is_auto_route:
-            auto_route_count += 1
-        else:
-            fsm_fallback_count += 1
-            
-        # Run route_and_splice
-        t_nexus0 = time.perf_counter()
-        resolved_id = orchestrator.route_and_splice(query_tokens, list(query_emb), sys_len, 0)
-        nexus_latencies_ms.append((time.perf_counter() - t_nexus0) * 1000.0)
-        
-        # Map back to tool name
-        pred_b = ""
-        for tool in tools:
-            if tool["id"] == resolved_id:
-                pred_b = tool["name"]
-                break
+                    
+                    t0 = time.perf_counter()
+                    try:
+                        res_a = llm.create_completion(
+                            prompt=prompt_a,
+                            max_tokens=15,
+                            temperature=0.0
+                        )
+                        lat_a.append((time.perf_counter() - t0) * 1000.0)
+                        pred_a = res_a["choices"][0]["text"].strip()
+                        is_hit_a = (target_tool in pred_a) or (pred_a in target_tool) or (pred_a.replace("`", "") == target_tool)
+                        if is_hit_a:
+                            hits_a += 1
+                    except Exception:
+                        is_hit_a = False
+                    llm.reset()
+                else:
+                    is_hit_a = False
+                    pred_a = "N/A (Context Overflow)"
                 
-        is_hit_b = (pred_b == target_tool)
-        if is_hit_b:
-            hits_b += 1
-        records.append({
-            "idx": idx,
-            "query": query,
-            "target_tool": target_tool,
-            "full_context_prediction": pred_a,
-            "nexus_prediction": pred_b,
-            "full_context_hit": is_hit_a,
-            "nexus_hit": is_hit_b,
-            "path": "auto_route" if is_auto_route else "fsm_fallback",
-            "slb_top1_tool_id": matches[0].tool_id if matches else 0,
-            "slb_top1_score": float(matches[0].score) if matches else 0.0,
-            "slb_margin": float((matches[0].score - matches[1].score) if len(matches) >= 2 else 0.0),
-        })
+                # (B) Scenario B
+                llm.eval(sys_tokens)
+                query_tokens_list = [int(t) for t in query_tokens]
+                
+                # Embed query with nomic-embed-v1.5 "search_query:" task prefix (asymmetric
+                # retrieval; must pair with the "search_document:" prefix used at registration).
+                query_emb_raw = llm_emb.embed(f"search_query: {query}")
+                query_emb = query_emb_raw[0] if (len(query_emb_raw) > 0 and isinstance(query_emb_raw[0], list)) else query_emb_raw
+                query_emb = np.array(query_emb, dtype=np.float32)
+                q_norm = np.linalg.norm(query_emb)
+                if q_norm > 0:
+                    query_emb = query_emb / q_norm
+                
+                # Track SLB search
+                t_slb0 = time.perf_counter()
+                matches = slb.search(query_emb, 5)  # Fetch up to 5 to measure Top-5 Recall
+                lat_slb.append((time.perf_counter() - t_slb0) * 1000.0)
+                
+                # Measure SLB Recall
+                match_ids = [m.tool_id for m in matches]
+                if len(match_ids) > 0 and match_ids[0] == target_id:
+                    top1_recall_hits += 1
+                if target_id in match_ids[:3]:
+                    top3_recall_hits += 1
+                if target_id in match_ids[:5]:
+                    top5_recall_hits += 1
+                
+                is_auto_route = False
+                if len(matches) >= 2:
+                    is_auto_route = (matches[0].score - matches[1].score) >= args.auto_route_margin
+                elif len(matches) > 0:
+                    is_auto_route = True
+                    
+                if is_auto_route:
+                    auto_route_count += 1
+                else:
+                    fsm_fallback_count += 1
+                    
+                # Run route_and_splice
+                t_nexus0 = time.perf_counter()
+                resolved_id = orchestrator.route_and_splice(query_tokens_list, list(query_emb), sys_len, 0)
+                lat_b.append((time.perf_counter() - t_nexus0) * 1000.0)
+                
+                # Map back
+                pred_b = ""
+                for tool in tools:
+                    if tool["id"] == resolved_id:
+                        pred_b = tool["name"]
+                        break
+                is_hit_b = (pred_b == target_tool)
+                if is_hit_b:
+                    hits_b += 1
+                    
+                # Clean up context
+                orchestrator.release_hazard(0)
+                llm._ctx.kv_cache_seq_rm(0, sys_len, -1)
+                llm.reset()
+                
+            accuracy_a = (hits_a / total) * 100 if total > 0 else 0.0
+            accuracy_b = (hits_b / total) * 100 if total > 0 else 0.0
+            top1_recall = (top1_recall_hits / total) * 100 if total > 0 else 0.0
+            top3_recall = (top3_recall_hits / total) * 100 if total > 0 else 0.0
+            top5_recall = (top5_recall_hits / total) * 100 if total > 0 else 0.0
+            auto_route_pct = (auto_route_count / total) * 100 if total > 0 else 0.0
+            fsm_fallback_pct = (fsm_fallback_count / total) * 100 if total > 0 else 0.0
             
-        # Clean up context for next iteration
-        orchestrator.release_hazard(0)
-        llm._ctx.kv_cache_seq_rm(0, sys_len, -1)
+            runs_acc_a.append(accuracy_a)
+            runs_acc_b.append(accuracy_b)
+            runs_rec1.append(top1_recall)
+            runs_rec3.append(top3_recall)
+            runs_rec5.append(top5_recall)
+            runs_auto_route.append(auto_route_pct)
+            runs_fsm_fallback.append(fsm_fallback_pct)
+            runs_latency_a.extend(lat_a)
+            runs_latency_b.extend(lat_b)
+            runs_latency_slb.extend(lat_slb)
+            runs_tokens_a.extend(tokens_a_list)
+            runs_tokens_b.extend(tokens_b_list)
+            
+            pass
+                
+        # Aggregate statistics
+        import statistics
+        def stats(vals):
+            if not vals:
+                return 0.0, 0.0
+            return statistics.mean(vals), (statistics.stdev(vals) if len(vals) > 1 else 0.0)
+            
+        mean_acc_a, std_acc_a = stats(runs_acc_a)
+        mean_acc_b, std_acc_b = stats(runs_acc_b)
+        mean_rec1, std_rec1 = stats(runs_rec1)
+        mean_rec3, std_rec3 = stats(runs_rec3)
+        mean_rec5, std_rec5 = stats(runs_rec5)
+        mean_auto, std_auto = stats(runs_auto_route)
+        mean_fallback, std_fallback = stats(runs_fsm_fallback)
         
-        if (idx + 1) % 10 == 0:
-            print(f"Processed {idx + 1}/{total} queries...")
-            
-    accuracy_a = (hits_a / total) * 100
-    accuracy_b = (hits_b / total) * 100
-    auto_route_pct = (auto_route_count / total) * 100
-    fsm_fallback_pct = (fsm_fallback_count / total) * 100
-    
-    print("\n======================================================================")
-    print("                           BENCHMARK RESULTS                          ")
-    print("======================================================================")
-    print(f"Scenario A: Full-Context Schema Prefill Accuracy: {accuracy_a:.1f}% ({hits_a}/{total})")
-    print(f"Scenario B: Nexus SLB Scan + FSM Masking Accuracy:  {accuracy_b:.1f}% ({hits_b}/{total})")
-    print("----------------------------------------------------------------------")
-    print(f"Auto-Route Fast Path Resolution:                    {auto_route_pct:.1f}% ({auto_route_count}/{total})")
-    print(f"FSM Fallback Resolution:                            {fsm_fallback_pct:.1f}% ({fsm_fallback_count}/{total})")
-    print("======================================================================")
+        avg_lat_a = statistics.mean(runs_latency_a) if runs_latency_a else 0.0
+        avg_lat_b = statistics.mean(runs_latency_b) if runs_latency_b else 0.0
+        avg_lat_slb = statistics.mean(runs_latency_slb) if runs_latency_slb else 0.0
+        
+        avg_tokens_a = statistics.mean(runs_tokens_a) if runs_tokens_a else 0.0
+        avg_tokens_b = statistics.mean(runs_tokens_b) if runs_tokens_b else 0.0
+        token_savings_pct = (1.0 - (avg_tokens_b / avg_tokens_a)) * 100.0 if avg_tokens_a > 0 else 0.0
+        
+        overall_summary[size] = {
+            "mean_acc_a": mean_acc_a, "std_acc_a": std_acc_a,
+            "mean_acc_b": mean_acc_b, "std_acc_b": std_acc_b,
+            "mean_rec1": mean_rec1, "std_rec1": std_rec1,
+            "mean_rec3": mean_rec3, "std_rec3": std_rec3,
+            "mean_rec5": mean_rec5, "std_rec5": std_rec5,
+            "mean_auto": mean_auto, "std_auto": std_auto,
+            "mean_fallback": mean_fallback, "std_fallback": std_fallback,
+            "avg_lat_a_ms": avg_lat_a,
+            "avg_lat_b_ms": avg_lat_b,
+            "avg_lat_slb_ms": avg_lat_slb,
+            "avg_tokens_a": avg_tokens_a,
+            "avg_tokens_b": avg_tokens_b,
+            "token_savings_pct": token_savings_pct,
+        }
+        res = overall_summary[size]
+        print(f"Results for N = {size}:")
+        if res['avg_tokens_a'] < 7500:
+            print(f"  Oracle Prefill Accuracy:    {mean_acc_a:.1f}% ± {std_acc_a:.1f}%")
+        else:
+            print(f"  Oracle Prefill Accuracy:    N/A (Context Overflow)")
+        print(f"  Nexus Routing Accuracy:     {mean_acc_b:.1f}% ± {std_acc_b:.1f}%")
+        print(f"  SLB Recall (Top-1/3/5):     {mean_rec1:.1f}% / {mean_rec3:.1f}% / {mean_rec5:.1f}%")
+        print(f"  Auto-Route / Fallback %:    {mean_auto:.1f}% / {mean_fallback:.1f}%")
+        if res['avg_tokens_a'] < 7500:
+            print(f"  Avg Latency (Oracle / Nexus):{avg_lat_a:.1f} ms / {avg_lat_b:.1f} ms (SLB search: {avg_lat_slb:.1f} ms)")
+        else:
+            print(f"  Avg Latency (Oracle / Nexus):N/A / {avg_lat_b:.1f} ms (SLB search: {avg_lat_slb:.1f} ms)")
+        print(f"  Avg Context Tokens (Oracle / Nexus): {avg_tokens_a:.1f} / {avg_tokens_b:.1f} ({token_savings_pct:.1f}% savings)")
 
+    # Print final comparison table
+    print("\n" + "="*80)
+    print("                       ROUTING COMPARATIVE SCALING CURVE")
+    print("="*80)
+    print(f"{'Size (N)':<10} | {'Oracle Acc':<14} | {'Nexus Acc':<14} | {'SLB R@1/3/5':<18} | {'Latency Save':<14} | {'Token Save':<10}")
+    print("-"*80)
+    for size in sizes:
+        res = overall_summary[size]
+        acc_a_str = f"{res['mean_acc_a']:.1f}%" if res['avg_tokens_a'] < 7500 else "N/A (Overflow)"
+        acc_b_str = f"{res['mean_acc_b']:.1f}%"
+        recall_str = f"{res['mean_rec1']:.0f}/{res['mean_rec3']:.0f}/{res['mean_rec5']:.0f}%"
+        lat_save = f"{(1.0 - res['avg_lat_b_ms']/res['avg_lat_a_ms'])*100.0:.1f}%" if (res['avg_lat_a_ms'] > 0 and res['avg_tokens_a'] < 7500) else "N/A"
+        tok_save = f"{res['token_savings_pct']:.1f}%"
+        print(f"{size:<10} | {acc_a_str:<14} | {acc_b_str:<14} | {recall_str:<18} | {lat_save:<14} | {tok_save:<10}")
+    print("="*80)
+
+    # Save to file
     write_artifact(
         args.output,
         "bench_routing_accuracy",
@@ -423,29 +683,17 @@ Selected Tool Name:"""
         config={
             "model_path": args.model,
             "embedding_model_path": args.embed_model,
-            "embedding_model_hash": file_sha256(args.embed_model) if Path(args.embed_model).exists() else "",
             "seed": args.seed,
-            "tool_count": len(tools),
-            "query_count": total,
-            "auto_route_margin": args.auto_route_margin,
-            "speculative_threshold": args.speculative_threshold,
-            "speculative_margin": args.speculative_margin,
+            "runs": runs,
+            "tool_sizes": sizes,
         },
-        metrics={
-            "full_context_accuracy_pct": {"unit": "percent", "raw_samples": [accuracy_a]},
-            "nexus_accuracy_pct": {"unit": "percent", "raw_samples": [accuracy_b]},
-            "auto_route_pct": {"unit": "percent", "raw_samples": [auto_route_pct]},
-            "fsm_fallback_pct": {"unit": "percent", "raw_samples": [fsm_fallback_pct]},
-            "full_context_latency_ms": {"unit": "ms", "raw_samples": full_context_latencies_ms},
-            "nexus_route_and_splice_latency_ms": {"unit": "ms", "raw_samples": nexus_latencies_ms},
-            "slb_scan_latency_ms": {"unit": "ms", "raw_samples": slb_latencies_ms},
-        },
-        records=records,
+        metrics=overall_summary,
+        records=[],
     )
     print(f"Wrote JSON artifact: {args.output}")
-
-    # Clean up directories and files robustly
+    
     if os.path.exists("test/schemas/jit_bloat"):
+        import shutil
         shutil.rmtree("test/schemas/jit_bloat")
 
 if __name__ == "__main__":

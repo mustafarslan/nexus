@@ -87,8 +87,26 @@ uint32_t NexusOrchestrator::route_and_splice(const std::vector<int32_t>& user_qu
         } else {
             deep_path_l0_miss_.fetch_add(1, std::memory_order_relaxed);
         }
-        deep_path_text_fallback_.fetch_add(1, std::memory_order_relaxed);
-        return 0;
+        if (!deep_splice_enabled_) {
+            // Legacy behavior: decline so Python performs the text prefill. RoPE Δθ would
+            // otherwise drift the offline .atb splice past max_splice_pos_.
+            deep_path_text_fallback_.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        // Depth-invariant path enabled: fall through and splice, with the depth-adaptive
+        // recompute fraction (eff_recompute_pct below) repairing the Δθ drift. No return.
+    }
+
+    // Depth-adaptive recompute fraction (never-regress). Ramps linearly from recompute_pct_
+    // at the cap to 100% (== full re-prefill, KL=0) by max_splice_pos_*recompute_full_mult_.
+    float eff_recompute_pct = recompute_pct_;
+    if (n_past > max_splice_pos_) {
+        const float lo = static_cast<float>(max_splice_pos_);
+        const float hi = lo * recompute_full_mult_;
+        const float frac = (hi > lo)
+            ? std::clamp((static_cast<float>(n_past) - lo) / (hi - lo), 0.0f, 1.0f)
+            : 1.0f;
+        eff_recompute_pct = recompute_pct_ + frac * (100.0f - recompute_pct_);
     }
 
     std::vector<NexusSemanticSLB::SearchResult> matches;
@@ -487,7 +505,7 @@ uint32_t NexusOrchestrator::route_and_splice(const std::vector<int32_t>& user_qu
         }
 
         auto schema_tok_it = tool_schema_tokens_.find(resolved_tool_id);
-        const bool fused_recompute = schema_tok_it != tool_schema_tokens_.end() && recompute_pct_ > 0.0f;
+        const bool fused_recompute = schema_tok_it != tool_schema_tokens_.end() && eff_recompute_pct > 0.0f;
 
         uint32_t suffix_start = schema_len;
         if (fused_recompute) {
@@ -496,7 +514,7 @@ uint32_t NexusOrchestrator::route_and_splice(const std::vector<int32_t>& user_qu
                 schema_len = static_cast<uint32_t>(schema_tokens.size());
             }
             const uint32_t n_sel = std::max(1u, static_cast<uint32_t>(
-                std::ceil(static_cast<double>(schema_len) * static_cast<double>(recompute_pct_) / 100.0)));
+                std::ceil(static_cast<double>(schema_len) * static_cast<double>(eff_recompute_pct) / 100.0)));
             suffix_start = (schema_len > n_sel) ? (schema_len - n_sel) : 0u;
             if (suffix_start < schema_len) {
                 std::lock_guard<std::mutex> lock(context_mutex_);

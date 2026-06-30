@@ -397,6 +397,15 @@ class NexusAgent:
             self.orchestrator.pin_warm_tool(int(tool_id))
             self.orchestrator.pin_block_tool(int(tool_id))
 
+    def enable_deep_splice(self, full_mult: float = 4.0):
+        """Phase v2.0: allow the .atb splice to run past max_splice_pos (deep multi-turn
+        context) instead of declining to a Python text prefill. The orchestrator repairs
+        RoPE Δθ drift with a depth-adaptive recompute fraction that ramps to 100% (==
+        re-prefill, KL=0) by max_splice_pos*full_mult, so top-1 never regresses below the
+        text-prefill baseline. Call AFTER registering tools (schema tokens must exist for
+        the drift repair to run)."""
+        self.orchestrator.set_deep_splice(True, float(full_mult))
+
     def deep_path_telemetry(self):
         """F0 deep-path (P > MAX_SPLICE_POS) read-only probe counters.
 
@@ -774,14 +783,16 @@ class NexusAgent:
 
         # Use dedicated embedding model if present, otherwise fallback to generative
         emb_model = self.embedding_llm if self.embedding_llm is not None else self.llm
-        query_embedding_raw = emb_model.embed(query)
-        query_embedding = query_embedding_raw[0] if (len(query_embedding_raw) > 0 and isinstance(query_embedding_raw[0], list)) else query_embedding_raw
-        query_embedding_list = [float(x) for x in query_embedding]
-
         test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../test"))
         if test_dir not in sys.path:
             sys.path.append(test_dir)
-        from nexus_retrieval import lexical_hashes
+        from nexus_retrieval import lexical_hashes, embed_query
+
+        # Embed via the shared helper so this path matches route_with_retrieval: it applies
+        # the nomic "search_query:" task prefix AND L2-normalizes. The previous raw
+        # emb_model.embed(query) did neither, which collapsed SLB recall on the splice path
+        # (probe: prefix + name-in-document lifts R@1 40%->74%, routing 68%->83% at N=250).
+        query_embedding_list = [float(x) for x in embed_query(emb_model, query)]
 
         n_past = self.llm.n_tokens
         prefix_tokens: list[int] = []

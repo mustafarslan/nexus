@@ -438,6 +438,10 @@ NB_MODULE(nexus_fsm_ext, m) {
         .def("get_recompute_pct", &NexusOrchestrator::get_recompute_pct)
         .def("set_max_splice_pos", &NexusOrchestrator::set_max_splice_pos, nb::arg("pos"))
         .def("get_max_splice_pos", &NexusOrchestrator::get_max_splice_pos)
+        .def("set_deep_splice", &NexusOrchestrator::set_deep_splice,
+             nb::arg("enabled"), nb::arg("full_mult") = 4.0f)
+        .def("get_deep_splice_enabled", &NexusOrchestrator::get_deep_splice_enabled)
+        .def("get_recompute_full_mult", &NexusOrchestrator::get_recompute_full_mult)
         .def("preload_tool", [](NexusOrchestrator& self, uint32_t tool_id, const std::string& path) {
             nb::gil_scoped_release release;
             self.preload_tool(tool_id, path);

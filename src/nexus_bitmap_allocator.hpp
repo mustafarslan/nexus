@@ -75,7 +75,7 @@ inline uint64_t get_random_value() {
  * The constructor enforces that base_ptr is 2MB-aligned to prevent offset
  * calculation errors from misaligned subtraction.
  */
-class QuantizedBitmapAllocator {
+class alignas(NEXUS_CACHE_LINE) QuantizedBitmapAllocator {
 private:
     struct BuddyNode {
         size_t prev = -1;
@@ -84,13 +84,19 @@ private:
         size_t order = 0;
     };
 
+    // Read-mostly geometry: touched on every alloc/free for offset math, never written
+    // after construction. Kept together so they share clean (non-bouncing) cache lines.
     void* base_ptr_;
     size_t total_size_;
     size_t num_blocks_;
     size_t max_order_;
     std::vector<BuddyNode> nodes_;
     std::vector<size_t> free_heads_;
-    std::mutex mutex_;
+    // Pin the contended lock to its own cache line so the atomic/lock traffic from one
+    // allocator can never invalidate (RFO-storm) the read-mostly geometry above or a
+    // neighbouring object's line. alignas on the class itself rounds sizeof up to a
+    // 128B multiple, so adjacent allocators also start on clean boundaries.
+    alignas(NEXUS_CACHE_LINE) std::mutex mutex_;
 
     void push_to_free_list(size_t i, size_t order) {
         nodes_[i].free = true;
@@ -239,5 +245,12 @@ public:
         return free_blocks * NEXUS_PAGE_ALIGNMENT;
     }
 };
+
+// Phase 2 alignment hardening: the allocator object starts on a cache line and occupies
+// whole lines, so concurrent allocators cannot false-share. (NEXUS_CACHE_LINE = 128.)
+static_assert(alignof(QuantizedBitmapAllocator) % NEXUS_CACHE_LINE == 0,
+              "QuantizedBitmapAllocator must be cache-line aligned (false-sharing guard)");
+static_assert(sizeof(QuantizedBitmapAllocator) % NEXUS_CACHE_LINE == 0,
+              "QuantizedBitmapAllocator size must be a whole number of cache lines");
 
 } // namespace nexus

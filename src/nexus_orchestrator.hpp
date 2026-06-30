@@ -46,6 +46,17 @@ private:
     float speculative_margin_;
     float auto_route_margin_;
     uint32_t max_splice_pos_;
+    // Phase v2.0 (depth-invariant splice). When deep_splice_enabled_ is false the
+    // orchestrator keeps the legacy behavior: decline (return 0) once n_past exceeds
+    // max_splice_pos_ so Python falls back to text prefill. When enabled, the deep
+    // splice proceeds with a depth-adaptive recompute fraction that ramps from
+    // recompute_pct_ at n_past==max_splice_pos_ to 100% at n_past==max_splice_pos_*
+    // recompute_full_mult_. Full recompute is numerically identical to a re-prefill
+    // (verified KL=0), so accuracy never regresses below the text-prefill baseline.
+    // CONTRACT: only enable when tool schema tokens are registered (register_tool_
+    // schema_tokens), otherwise the drift repair cannot run.
+    bool deep_splice_enabled_{false};
+    float recompute_full_mult_{4.0f};
     std::atomic<uint64_t> splice_guard_fallback_count_{0};
 
     // F0 deep-path (P > max_splice_pos_) instrumentation. Read-only probe this phase:
@@ -96,6 +107,14 @@ public:
     void set_recompute_pct(float pct) { recompute_pct_ = pct; }
     float get_recompute_pct() const { return recompute_pct_; }
     void set_max_splice_pos(uint32_t pos) { max_splice_pos_ = pos; }
+    // Enable depth-invariant splicing past max_splice_pos_ with never-regress recompute.
+    // full_mult: n_past multiple of max_splice_pos_ at which recompute reaches 100%.
+    void set_deep_splice(bool enabled, float full_mult = 4.0f) {
+        deep_splice_enabled_ = enabled;
+        if (full_mult > 1.0f) recompute_full_mult_ = full_mult;
+    }
+    bool get_deep_splice_enabled() const { return deep_splice_enabled_; }
+    float get_recompute_full_mult() const { return recompute_full_mult_; }
     void preload_tool(uint32_t tool_id, const std::string& path);
     void pin_warm_tool(uint32_t tool_id) { seq_warm_cache_.pin_tool(tool_id); }
     void pin_block_tool(uint32_t tool_id) { if (block_cache_) block_cache_->pin_tool(tool_id); }

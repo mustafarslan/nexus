@@ -122,6 +122,49 @@ def test_r100_recompute_matches_reference_at_p1024(llm_ctx):
     assert kl < 0.05, f"P1024 r100 KL too high after invalidate fix: {kl}"
 
 
+def _adaptive_recompute_pct(n_past, max_splice_pos=256, full_mult=4.0, base_pct=5.0):
+    """Mirror of NexusOrchestrator's depth-adaptive eff_recompute_pct ramp (Phase 1)."""
+    if n_past <= max_splice_pos:
+        return base_pct
+    lo, hi = float(max_splice_pos), max_splice_pos * full_mult
+    frac = min(max((n_past - lo) / (hi - lo), 0.0), 1.0) if hi > lo else 1.0
+    return base_pct + frac * (100.0 - base_pct)
+
+
+def test_adaptive_recompute_never_regress_at_p512(llm_ctx):
+    """Phase 1: the depth-adaptive recompute fraction (~37% at P=512) must hold top-1
+    against the reference, i.e. the deep splice never regresses below text prefill."""
+    from nexus_recompute import recompute_tail
+
+    llm, ctx, cache = llm_ctx
+    tool = load_first_10_tools()[0]
+    atb = Path("results/phaseA_tool_match_work/tool_0.isolated.atb")
+    if not atb.exists():
+        pytest.skip("missing compiled ATB")
+    case = queries_dataset[0]
+    schema_tokens = tokenize(llm, schema_text_for(tool))
+    query_tokens = tokenize(llm, format_query(case["query"]))
+    p_start = 512
+    preceding = build_preceding_tokens(llm, "You are a tool-using assistant.", p_start)
+
+    ref = reference_logits(ctx, preceding, schema_tokens, query_tokens)
+    nexus_fsm_ext.clear_kv_cache(ctx)
+    if preceding:
+        nexus_fsm_ext.decode_tokens(ctx, preceding, 0, 0)
+    handle = cache.get_or_load(str(atb))
+    nexus_fsm_ext.inject_tool_page(ctx, handle, p_start, 0)
+    eff = _adaptive_recompute_pct(p_start)
+    assert 30.0 < eff < 45.0, f"unexpected adaptive pct at P=512: {eff}"
+    recompute_tail(ctx, schema_tokens, p_start, eff)
+    splice = np.array(
+        nexus_fsm_ext.decode_tokens(ctx, query_tokens, p_start + len(schema_tokens), 0),
+        dtype=np.float32,
+    )
+    kl = kl_ref_to_splice(ref, splice)
+    assert _top1(ref) == _top1(splice), f"P512 adaptive top1 regressed kl={kl}"
+    assert kl < 0.05, f"P512 adaptive KL too high: {kl}"
+
+
 def test_fused_recompute_matches_two_step_at_p256(llm_ctx):
     """Fused suffix+query batch must match invalidate→suffix→query logits."""
     from nexus_recompute import plan_suffix_recompute, recompute_fused_with_query, recompute_tail
