@@ -813,7 +813,7 @@ class NexusAgent:
         """
         Legacy splice path: routing, tool KV-splicing, grammar-constrained generation,
         and unsplicing. NOTE: argument fidelity over spliced KV is degraded at the
-        splice seam (see results/v1.2_sidecar_canonical/REPORT.md) -- prefer
+        splice seam (see results/v2.0_canonical/raw/sidecar/accuracy.json) -- prefer
         generate_via_hybrid. Kept for the splice regression path.
 
         Coarse-grained concurrency (Decision 2): the whole turn is one _ctx_lock
