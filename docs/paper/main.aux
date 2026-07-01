@@ -1,0 +1,108 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{anthropic2024mcp}
+\citation{vaswani2017attention}
+\citation{su2024roformer}
+\citation{kwon2023vllm,zheng2024sglang}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{section.1}\protected@file@percent }
+\citation{ragmcp2025}
+\citation{tscg2026}
+\citation{ntilc2026}
+\citation{kwon2023vllm,zheng2024sglang}
+\citation{vattention2025,ellm}
+\citation{redknot2026}
+\citation{stepanek2026}
+\citation{agrawal2024sarathi,patel2024splitwise,zhong2024distserve}
+\citation{transkvcache}
+\citation{peng2023yarn}
+\citation{dao2022flashattention,dao2023flashattention2}
+\citation{willard2023outlines,beurer2023lmql,guidance2023}
+\citation{arslan2026aeon}
+\citation{ragmcp2025}
+\citation{kwon2023vllm}
+\citation{zheng2024sglang}
+\citation{vattention2025}
+\citation{redknot2026}
+\citation{vaswani2017attention}
+\citation{su2024roformer}
+\@writefile{toc}{\contentsline {section}{\numberline {II}Related Work}{2}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{II}{2}{Related Work}{section.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {III}Background and Motivation}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}Self-Attention and the Schema-Prefill Wall}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}RoPE Phase Drift}{2}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:rope}{{\mbox  {III-B}}{2}{RoPE Phase Drift}{subsection.3.2}{}}
+\newlabel{eq:drift}{{1}{2}{RoPE Phase Drift}{equation.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Nexus in context. In-place KV-serving systems never relocate a compiled block; Nexus relocates per-tool blocks and decouples routing from the splice path. Non-Nexus numbers are reported on different hardware and workloads ($\dagger $: contextual, \emph  {not} a controlled head-to-head; see \texttt  {\relax \fontsize  {9}{10pt}\selectfont  results/comparison\_sources.md}).}}{3}{table.1}\protected@file@percent }
+\newlabel{tab:comparison}{{I}{3}{Nexus in context. In-place KV-serving systems never relocate a compiled block; Nexus relocates per-tool blocks and decouples routing from the splice path. Non-Nexus numbers are reported on different hardware and workloads ($\dagger $: contextual, \emph {not} a controlled head-to-head; see \code {results/comparison\_sources.md})}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Depth-Adaptive Recompute}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{eq:adaptive}{{2}{3}{Depth-Adaptive Recompute}{equation.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {IV}Physical Limitations and Negative Results}{3}{section.4}\protected@file@percent }
+\newlabel{sec:limits}{{IV}{3}{Physical Limitations and Negative Results}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-A}}The Anchored/Off-Anchor Fidelity Boundary}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Bare-splice next-token divergence vs.\ placement offset, recompute disabled (\texttt  {\relax \fontsize  {9}{10pt}\selectfont  dkl\_sweep.json}; $10$ queries/offset, $95\%$ bootstrap CI). The contiguous-suffix splice holds $D_{\mathrm  {KL}}{\sim }10^{-2}$ nats with top-1 agreement $=1.0$ across the whole $0$--$2048$ range---two orders of magnitude below the retired LegoLink scattered-recompute point ($5.7$ nats at $\Delta \mathrm  {pos}{=}1024$). The enforced threshold $P{=}256$ (dashed) is a conservative repair-start, not a fidelity cliff.}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:dkl}{{1}{4}{Bare-splice next-token divergence vs.\ placement offset, recompute disabled (\code {dkl\_sweep.json}; $10$ queries/offset, $95\%$ bootstrap CI). The contiguous-suffix splice holds $D_{\mathrm {KL}}{\sim }10^{-2}$ nats with top-1 agreement $=1.0$ across the whole $0$--$2048$ range---two orders of magnitude below the retired LegoLink scattered-recompute point ($5.7$ nats at $\Delta \mathrm {pos}{=}1024$). The enforced threshold $P{=}256$ (dashed) is a conservative repair-start, not a fidelity cliff}{figure.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Reference-free drift gate: per-head drift varies (max $175$--$207$, mean $91$--$105$), but the K-variance proxy fails to rank-correlate with it ($\rho =0.193$) (\texttt  {\relax \fontsize  {9}{10pt}\selectfont  gating\_nogo.json}).}}{4}{table.2}\protected@file@percent }
+\newlabel{tab:gating}{{II}{4}{Reference-free drift gate: per-head drift varies (max $175$--$207$, mean $91$--$105$), but the K-variance proxy fails to rank-correlate with it ($\rho =0.193$) (\code {gating\_nogo.json})}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-B}}The Failure of Reference-Free Drift Gating}{4}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:gating}{{\mbox  {IV-B}}{4}{The Failure of Reference-Free Drift Gating}{subsection.4.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Architecture: Retrieval-Decoupled Routing}{4}{section.5}\protected@file@percent }
+\newlabel{sec:arch}{{V}{4}{Architecture: Retrieval-Decoupled Routing}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-A}}Semantic Lookaside Buffer and Gate}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-B}}Execution Sidecar and Compressed IR}{4}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Systems Implementation}{4}{section.6}\protected@file@percent }
+\newlabel{sec:systems}{{VI}{4}{Systems Implementation}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-A}}Compiled Tool Blocks and Splice}{4}{subsection.6.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Nexus request flow. Routing (blue, lower path) depends only on the query embedding and the tool registry, never on the deep context, so it is depth-independent. KV-cache acceleration (upper, dashed) is a separate concern: an anchored splice is output-exact for $n_{\mathrm  {past}}\le 256$, while beyond it the depth-adaptive repair $R(n_{\mathrm  {past}})$ of \eqref  {eq:adaptive} escalates to a full re-prefill. Arguments are generated over a compressed textual signature, not over spliced KV.}}{5}{figure.2}\protected@file@percent }
+\newlabel{fig:arch}{{2}{5}{Nexus request flow. Routing (blue, lower path) depends only on the query embedding and the tool registry, never on the deep context, so it is depth-independent. KV-cache acceleration (upper, dashed) is a separate concern: an anchored splice is output-exact for $n_{\mathrm {past}}\le 256$, while beyond it the depth-adaptive repair $R(n_{\mathrm {past}})$ of \eqref {eq:adaptive} escalates to a full re-prefill. Arguments are generated over a compressed textual signature, not over spliced KV}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-B}}Transposed-V Splicing for Soft-Capped Attention}{5}{subsection.6.2}\protected@file@percent }
+\newlabel{sec:vtrans}{{\mbox  {VI-B}}{5}{Transposed-V Splicing for Soft-Capped Attention}{subsection.6.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-C}}Cache-Line Hardening and Concurrency}{5}{subsection.6.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Physical splice with memory mapping. The compiled block is mapped via zero-copy \texttt  {\relax \fontsize  {9}{10pt}\selectfont  mmap} into virtual memory. Contiguous F16 keys and values are then blitted into the live cache; the trailing suffix fraction $R(n_{\mathrm  {past}})$ is re-decoded to stitch the seam. Layouts are transposed for soft-capped architectures (\S  \ref {sec:vtrans}).}}{5}{figure.3}\protected@file@percent }
+\newlabel{fig:atb}{{3}{5}{Physical splice with memory mapping. The compiled block is mapped via zero-copy \code {mmap} into virtual memory. Contiguous F16 keys and values are then blitted into the live cache; the trailing suffix fraction $R(n_{\mathrm {past}})$ is re-decoded to stitch the seam. Layouts are transposed for soft-capped architectures (\S \ref {sec:vtrans})}{figure.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-D}}L0 Exact-Token Radix Arena}{5}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VII}Evaluation}{5}{section.7}\protected@file@percent }
+\newlabel{sec:eval}{{VII}{5}{Evaluation}{section.7}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {III}{\ignorespaces Deep-splice TTFT vs.\ depth ($n{=}15$ trials/cell). Never-regress holds everywhere (top-1 OK, $D_{\mathrm  {KL}}(\mathbf  {p}_0 \parallel \mathbf  {p}_{\mathrm  {splice}}) \approx 0$); speedup narrows to parity as recompute escalates. Eq.~\eqref  {eq:adaptive} reproduces the $R$(\%) column exactly (verified), so the recompute schedule can be audited without the code. Speedup intervals propagate the per-cell bootstrap $95\%$ CIs of the prefill and splice medians (independent timing loops). Source: \texttt  {\relax \fontsize  {9}{10pt}\selectfont  deep\_splice\_ttft.json}.}}{6}{table.3}\protected@file@percent }
+\newlabel{tab:perf}{{III}{6}{Deep-splice TTFT vs.\ depth ($n{=}15$ trials/cell). Never-regress holds everywhere (top-1 OK, $D_{\mathrm {KL}}(\mathbf {p}_0 \parallel \mathbf {p}_{\mathrm {splice}}) \approx 0$); speedup narrows to parity as recompute escalates. Eq.~\eqref {eq:adaptive} reproduces the $R$(\%) column exactly (verified), so the recompute schedule can be audited without the code. Speedup intervals propagate the per-cell bootstrap $95\%$ CIs of the prefill and splice medians (independent timing loops). Source: \code {deep\_splice\_ttft.json}}{table.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-A}}Depth-Adaptive Splice: TTFT and Never-Regress}{6}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-B}}Routing Accuracy and Registry Scale}{6}{subsection.7.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces TTFT speedup vs.\ depth for the two recompute curves (\texttt  {\relax \fontsize  {9}{10pt}\selectfont  deep\_splice\_ttft.json}). Higher $K$ delays full recompute, sustaining speedup deeper at the cost of a larger repaired suffix; both converge to parity as $R(n_{\mathrm  {past}})\!\to \!100\%$.}}{6}{figure.4}\protected@file@percent }
+\newlabel{fig:ttft}{{4}{6}{TTFT speedup vs.\ depth for the two recompute curves (\code {deep\_splice\_ttft.json}). Higher $K$ delays full recompute, sustaining speedup deeper at the cost of a larger repaired suffix; both converge to parity as $R(n_{\mathrm {past}})\!\to \!100\%$}{figure.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-C}}Argument Fidelity}{6}{subsection.7.3}\protected@file@percent }
+\bibstyle{IEEEtran}
+\bibdata{references}
+\bibcite{anthropic2024mcp}{1}
+\bibcite{vaswani2017attention}{2}
+\bibcite{su2024roformer}{3}
+\bibcite{kwon2023vllm}{4}
+\bibcite{zheng2024sglang}{5}
+\bibcite{ragmcp2025}{6}
+\bibcite{tscg2026}{7}
+\bibcite{ntilc2026}{8}
+\bibcite{vattention2025}{9}
+\@writefile{lot}{\contentsline {table}{\numberline {IV}{\ignorespaces Routing and micro-costs at $N{=}250$ tools. Proportions carry Wilson $95\%$ intervals (bracketed); ${\ge }x$ denotes the lower bound of a $100\%$ cell. Sources: \texttt  {\relax \fontsize  {9}{10pt}\selectfont  routing\_accuracy\_n250.json}, \texttt  {\relax \fontsize  {9}{10pt}\selectfont  slb\_latency.json}, \texttt  {\relax \fontsize  {9}{10pt}\selectfont  sidecar/accuracy.json}, \texttt  {\relax \fontsize  {9}{10pt}\selectfont  calibration.json}, \texttt  {\relax \fontsize  {9}{10pt}\selectfont  l0\_radix.json}.}}{7}{table.4}\protected@file@percent }
+\newlabel{tab:micro}{{IV}{7}{Routing and micro-costs at $N{=}250$ tools. Proportions carry Wilson $95\%$ intervals (bracketed); ${\ge }x$ denotes the lower bound of a $100\%$ cell. Sources: \code {routing\_accuracy\_n250.json}, \code {slb\_latency.json}, \code {sidecar/accuracy.json}, \code {calibration.json}, \code {l0\_radix.json}}{table.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-D}}Discussion}{7}{subsection.7.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VIII}Limitations and Scope}{7}{section.8}\protected@file@percent }
+\newlabel{sec:scope}{{VIII}{7}{Limitations and Scope}{section.8}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Routing accuracy vs.\ registry size (\texttt  {\relax \fontsize  {9}{10pt}\selectfont  routing\_accuracy\_n250.json}). Nexus stays near $89\%$ as $N$ grows to $250$; the concatenate-all oracle is accurate at $N=10$ but overflows the context window at $N\ge 50$ and cannot route at all.}}{7}{figure.5}\protected@file@percent }
+\newlabel{fig:route}{{5}{7}{Routing accuracy vs.\ registry size (\code {routing\_accuracy\_n250.json}). Nexus stays near $89\%$ as $N$ grows to $250$; the concatenate-all oracle is accurate at $N=10$ but overflows the context window at $N\ge 50$ and cannot route at all}{figure.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {IX}Conclusion}{7}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{References}{7}{section*.1}\protected@file@percent }
+\bibcite{ellm}{10}
+\bibcite{redknot2026}{11}
+\bibcite{stepanek2026}{12}
+\bibcite{agrawal2024sarathi}{13}
+\bibcite{patel2024splitwise}{14}
+\bibcite{zhong2024distserve}{15}
+\bibcite{transkvcache}{16}
+\bibcite{peng2023yarn}{17}
+\bibcite{dao2022flashattention}{18}
+\bibcite{dao2023flashattention2}{19}
+\bibcite{willard2023outlines}{20}
+\bibcite{beurer2023lmql}{21}
+\bibcite{guidance2023}{22}
+\bibcite{arslan2026aeon}{23}
+\gdef \@abspage@last{8}

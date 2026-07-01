@@ -1,0 +1,55 @@
+\documentclass{article}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc,shapes.geometric}
+
+\definecolor{nxgray}{RGB}{120,120,120}
+\definecolor{nxblue}{RGB}{0,100,255}
+\definecolor{nxred}{RGB}{255,50,50}
+\definecolor{nxteal}{RGB}{0,150,150}
+\definecolor{nxamber}{RGB}{255,150,0}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\small,
+  node distance=8mm, % INCREASED
+  box/.style={rounded corners=2pt,draw=nxgray,line width=0.5pt,align=center,
+    inner sep=3pt,minimum height=8mm,fill=white},
+  hot/.style={box,draw=nxblue,fill=nxblue!6},
+  neg/.style={box,draw=nxred,fill=nxred!5},
+  flow/.style={-{Stealth[length=2mm]},draw=nxgray,line width=0.6pt},
+]
+\node[box] (q) {User query};
+\node[hot,right=of q] (emb) {Embed\\\scriptsize \code{nomic v1.5} (INT8)};
+\node[hot,right=of emb] (slb) {SLB scan\\\scriptsize INT8 SIMD, top-$k$};
+\node[hot,right=of slb] (gate) {Margin gate\\\scriptsize $\tau{=}0.0136$ (P20)};
+\node[hot,right=of gate] (ce) {Cross-encoder\\\scriptsize rerank ($\sim$20\% fire)};
+\node[hot,below=10mm of ce] (tool) {Resolved tool id};
+
+\node[box,below=10mm of slb] (ir) {Semantic compressed IR\\\scriptsize signature, 19 tok (p50)};
+\node[hot,left=of ir] (fsm) {FSM-masked\\arg generation\\\scriptsize JSON grammar};
+\node[box,left=of fsm] (out) {Tool call\\\scriptsize name + args};
+
+\node[hot,above=12mm of gate] (splice) {Anchored splice\\\scriptsize $n_{\mathrm{past}}{\le}256$, $D_{\mathrm{KL}}{\approx}0$};
+\node[neg,above=12mm of ce] (deep) {Deep splice / re-prefill\\\scriptsize $n_{\mathrm{past}}{>}256$: $R(n_{\mathrm{past}})$};
+
+\draw[flow] (q) -- (emb);
+\draw[flow] (emb) -- (slb);
+\draw[flow] (slb) -- (gate);
+\draw[flow] (gate) -- (ce);
+\draw[flow] (ce) -- (tool);
+\draw[flow] (tool) -- (ir);
+\draw[flow] (ir) -- (fsm);
+\draw[flow] (fsm) -- (out);
+\draw[flow,dashed,draw=nxblue] (gate) -- (splice);
+\draw[flow,dashed,draw=nxred] (gate) -- (deep);
+\begin{scope}[on background layer]
+  \node[fit=(splice)(deep),draw=nxgray,dashed,rounded corners,inner sep=4pt,
+    label={[nxgray,font=\scriptsize,anchor=south,yshift=2mm]above:KV-splice acceleration (schema prefill)}] {};
+  \node[fit=(emb)(ce)(tool)(fsm),fill=nxteal!4,draw=nxteal!40,dashed,rounded corners,inner sep=6pt,
+    label={[nxteal,font=\scriptsize,anchor=north,yshift=-2mm]below:Coarse re-entrant context lock (serialized turn execution for determinism)}] {};
+\end{scope}
+\end{tikzpicture}
+\end{document}

@@ -1,0 +1,14 @@
+{
+  "benchmark": "slb_search_latency_synthetic",
+  "n_tools": 250,
+  "emb_dim": 768,
+  "trials": 200,
+  "median_us": 8.250121027231216,
+  "ci95_us": [
+    8.250121027231216,
+    8.291099220514297
+  ],
+  "note": "synthetic unit-norm random vectors; pure INT8 SIMD scan timing, not accuracy",
+  "git_sha": "1ce4aa4364ce38f5972311792ec56481a2e90399",
+  "timestamp": "2026-07-01T06:40:45Z"
+}

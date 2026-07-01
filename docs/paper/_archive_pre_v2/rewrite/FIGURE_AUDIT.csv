@@ -1,0 +1,6 @@
+figure,class,prior_data_source,prior_issue,decision,action
+fig_e2e_cdf,empirical,e2e_cdf.csv (Run B 237ms),stale data + 'sub-250ms' overclaim,REGENERATE,"-> fig_e2e_cdf_v1_1.pdf from e2e_clean_n30 true-TTFT; old moved to figures/_legacy_prefreeze/"
+fig_pareto_frontier,empirical,pareto_frontier.csv (Run B),'strictly dominates' overclaim,REGENERATE,"-> fig_pareto_frontier_v1_1.pdf from canonical; caption states trade-off not dominance; old quarantined"
+fig_ttft_waterfall,empirical,ttft_waterfall.csv (legacy),route-only stages mixed w/ TTFT; not regenerated,REMOVE_FROM_MAIN,"removed from main.tex; quarantined to figures/_legacy_prefreeze/"
+fig_scalability,empirical,scalability_curve.csv (pre-freeze),not regenerated,REMOVE_FROM_MAIN,"removed from main.tex; quarantined; SLB cited as legacy text"
+pipeline/arch diagram (README mermaid),conceptual,README,showed Path A/B; minor,RELABEL,"README mermaid kept; Path B labeled text-prefill fallback (already honest)"

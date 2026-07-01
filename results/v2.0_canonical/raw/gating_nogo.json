@@ -1,0 +1,26 @@
+{
+  "benchmark": "reference_free_micro_gate_go_no_go",
+  "source": "test/profile_head_drift.py; committed verdict in results/v2_phase3_vtrans/PHASE2_GONOGO.md",
+  "git_sha": "1ce4aa4364ce38f5972311792ec56481a2e90399",
+  "hardware": "Apple M4 Max, Darwin 25.5.0 arm64 (UMA/Metal)",
+  "model": "Qwen2.5-14B-Instruct Q4_K_M",
+  "probe": "tool_0.atb",
+  "hypothesis": "A cheap reference-free runtime proxy (per-head live preceding-context K-variance) predicts per-head splice drift, enabling an online micro-gate.",
+  "spearman_threshold": 0.40,
+  "mean_spearman": 0.193,
+  "verdict": "NO-GO",
+  "per_condition": [
+    {"p_start": 256,  "ctx": "on",  "max_drift": 207.1, "mean_drift": 105.2, "spearman": 0.147},
+    {"p_start": 256,  "ctx": "off", "max_drift": 195.3, "mean_drift":  97.8, "spearman": 0.221},
+    {"p_start": 1024, "ctx": "on",  "max_drift": 193.2, "mean_drift":  98.4, "spearman": 0.182},
+    {"p_start": 1024, "ctx": "off", "max_drift": 189.1, "mean_drift":  96.4, "spearman": 0.250},
+    {"p_start": 2048, "ctx": "on",  "max_drift": 194.7, "mean_drift":  97.6, "spearman": 0.159},
+    {"p_start": 2048, "ctx": "off", "max_drift": 175.4, "mean_drift":  91.0, "spearman": 0.197}
+  ],
+  "findings": [
+    "The reference-free proxy does not predict drift: mean Spearman rho = 0.193 (< 0.40 target).",
+    "Mean per-head drift is nearly constant (91-105) across all depths and both on-/off-topic contexts, so there is no per-request variance for a scalar-threshold gate to discriminate.",
+    "Phase 1's depth-adaptive recompute already repairs this drift (capstone: top-1 held, KL to 0 at all depths)."
+  ],
+  "decision": "Ship only the cache-line alignment hardening (Component A); do not ship the online micro-gate. Keep the deterministic depth-adaptive recompute curve as the Path-A<->B repair mechanism."
+}

@@ -1,0 +1,36 @@
+{
+  "benchmark": "l0_radix_warm_prefix",
+  "model": "Qwen2.5-14B-Instruct Q4_K_M",
+  "git_sha": "1ce4aa4364ce38f5972311792ec56481a2e90399",
+  "n_seeds": 10,
+  "hit_rate_mean": 0.695,
+  "hit_rate_min": 0.58,
+  "hit_rate_max": 0.8,
+  "copy_p50_us_median": 3.041,
+  "copy_p50_us_min": 2.708,
+  "copy_p50_us_max": 3.083,
+  "per_seed_hit": [
+    0.65,
+    0.8,
+    0.73,
+    0.69,
+    0.68,
+    0.65,
+    0.72,
+    0.58,
+    0.69,
+    0.76
+  ],
+  "per_seed_copy_p50_us": [
+    2.708,
+    3.041,
+    3,
+    3.042,
+    3.083,
+    3.041,
+    3,
+    3.041,
+    3.042,
+    3.042
+  ]
+}

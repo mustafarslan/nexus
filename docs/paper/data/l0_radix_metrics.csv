@@ -1,0 +1,4 @@
+# L0 radix exact-token walk — C++ hardware timing only
+mode,hit_rate_pct,fragmentation_pct,copy_p50_us,copy_p99_us,n_requests,provenance
+exact_token,69.5,30.5,3.0,16.623,1000,bench_phase28_radix_prefix C++ microbench
+chunk32_simulated,0.0,100.0,,,0,RELEASE_V1 graveyard: FNV-1a 32-token chunking 0% L0 hit

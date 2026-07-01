@@ -1,0 +1,651 @@
+{
+  "summary": {
+    "arm": "V1.6_HYBRID (bare typed IR, no exemplar/desc; gold-args eval)",
+    "n_routing": 30,
+    "routing_accuracy": 0.8666666666666667,
+    "ir_tokens_p50": 19.0,
+    "ir_tokens_p99": 32.0,
+    "n_consistency": 30,
+    "n_routed_ok": 26,
+    "specified_arg_accuracy": 0.8536585365853658,
+    "specified_fields_total": 41,
+    "specified_fields_correct": 35,
+    "placeholder_leak_count": 0,
+    "json_valid_rate_hybrid": 1.0,
+    "ttft_first_arg_token_ms_hybrid_p50": 427.9272500425577,
+    "ttft_first_arg_token_ms_oracle_fullschema_p50": 652.6529995026067,
+    "coref_tool_acc": 1.0,
+    "coref_arg_acc": 1.0
+  },
+  "consistency_records": [
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 4,
+      "n_correct": 4,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "owner": true,
+        "repo": true,
+        "path": true,
+        "content": true
+      },
+      "case": 0,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"alice\", \"repo\": \"test-repo\", \"path\": \"README.md\", \"content\": \"Hello World\", \"message\": \"Add README.md file with Hello World content\", \"branch\": \"main\"} ",
+      "gold": {
+        "owner": "alice",
+        "repo": "test-repo",
+        "path": "readme.md",
+        "content": "hello world"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 4,
+      "n_correct": 4,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "owner": true,
+        "repo": true,
+        "path": true,
+        "branch": true
+      },
+      "case": 1,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"bob\", \"repo\": \"app-settings\", \"path\": \"config.json\", \"content\": \"new config content\", \"message\": \"Update config.json\", \"branch\": \"dev\"} ",
+      "gold": {
+        "owner": "bob",
+        "repo": "app-settings",
+        "path": "config.json",
+        "branch": "dev"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 1,
+      "specified_agreement": 0.5,
+      "field_results": {
+        "repo": false,
+        "path": true
+      },
+      "case": 2,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"run-tasks\", \"repo\": \"scripts\", \"path\": \"script.py\", \"content\": \"print('Hello, world!')\", \"message\": \"Add script.py with basic print statement\", \"branch\": \"main\"} ",
+      "gold": {
+        "repo": "run-tasks",
+        "path": "script.py"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 1,
+      "specified_agreement": 0.5,
+      "field_results": {
+        "repo": false,
+        "path": true
+      },
+      "case": 3,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"server-monitor\", \"repo\": \"logs\", \"path\": \"log.txt\", \"content\": \"latest logs\", \"message\": \"Write the latest logs to log.txt in repo server-monitor\", \"branch\": \"main\"} ",
+      "gold": {
+        "repo": "server-monitor",
+        "path": "log.txt"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 3,
+      "n_correct": 1,
+      "specified_agreement": 0.3333333333333333,
+      "field_results": {
+        "repo": false,
+        "path": false,
+        "branch": true
+      },
+      "case": 4,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_branch",
+      "routed_ok": false,
+      "hybrid": "{\"owner\": \"user\", \"repo\": \"repo\", \"branch\": \"dev\", \"from_branch\": \"main\"} ",
+      "gold": {
+        "repo": "auto-tests",
+        "path": "test.sh",
+        "branch": "dev"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 3,
+      "n_correct": 0,
+      "specified_agreement": 0.0,
+      "field_results": {
+        "owner": false,
+        "repo": false,
+        "path": false
+      },
+      "case": 5,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_repository",
+      "routed_ok": false,
+      "hybrid": "{\"name\": \"index.html\", \"description\": \"\", \"private\": false, \"autoInit\": false} ",
+      "gold": {
+        "owner": "charlie",
+        "repo": "web-app",
+        "path": "index.html"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 1,
+      "specified_agreement": 0.5,
+      "field_results": {
+        "repo": false,
+        "path": true
+      },
+      "case": 6,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"user123\", \"repo\": \"project\", \"path\": \"README.md\", \"content\": \"## Setup Instructions\\n\\n1. Clone the repository\\n2. Install dependencies\\n3. Run the application\", \"message\": \"Add setup instructions to README.md\", \"branch\": \"main\"}",
+      "gold": {
+        "repo": "project-repo",
+        "path": "readme.md"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 3,
+      "n_correct": 2,
+      "specified_agreement": 0.6666666666666666,
+      "field_results": {
+        "repo": true,
+        "path": false,
+        "branch": true
+      },
+      "case": 7,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "push_files",
+      "routed_ok": false,
+      "hybrid": "{\"owner\": \"user\", \"repo\": \"database-utils\", \"branch\": \"main\", \"files\": [{\"path\": \"data.csv\", \"content\": \"base64_encoded_content_of_data.csv\"}], \"message\": \"Add data.csv\"} ",
+      "gold": {
+        "repo": "database-utils",
+        "path": "data.csv",
+        "branch": "main"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 1,
+      "specified_agreement": 0.5,
+      "field_results": {
+        "repo": false,
+        "path": true
+      },
+      "case": 8,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"open-source-project\", \"repo\": \"main-repo\", \"path\": \"license.txt\", \"content\": \"MIT License\\n\\nCopyright (c) 2023 Your Name\\n\\nPermission is hereby granted, etc.\", \"message\": \"Add MIT license file to repository\", \"branch\": \"main\"} ",
+      "gold": {
+        "repo": "open-source-project",
+        "path": "license.txt"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 2,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "repo": true,
+        "path": true
+      },
+      "case": 9,
+      "gold_tool": "create_or_update_file",
+      "pred_tool": "create_or_update_file",
+      "routed_ok": true,
+      "hybrid": "{\"owner\": \"ml-inference\", \"repo\": \"ml-inference\", \"path\": \"main.py\", \"content\": \"def predict(input):\\n    return model.predict(input)\", \"message\": \"Update main.py file content\", \"branch\": \"main\"} ",
+      "gold": {
+        "repo": "ml-inference",
+        "path": "main.py"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 10,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"python web framework\"} ",
+      "gold": {
+        "query": "python web framework"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 11,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"machine learning\"} ",
+      "gold": {
+        "query": "machine learning"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 12,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"rust-game-engine\"} ",
+      "gold": {
+        "query": "rust-game-engine"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 13,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"docker configurations\"} ",
+      "gold": {
+        "query": "docker configurations"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 14,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"react-native-navigation\"} ",
+      "gold": {
+        "query": "react-native-navigation"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 0,
+      "specified_agreement": 0.0,
+      "field_results": {
+        "query": false
+      },
+      "case": 15,
+      "gold_tool": "search_repositories",
+      "pred_tool": "push_files",
+      "routed_ok": false,
+      "hybrid": "{\"owner\": \"user123\", \"repo\": \"LLM-FineTuning\", \"branch\": \"main\", \"files\": [{\"path\": \"scripts/fine_tuning_script.py\", \"content\": \"#!/usr/bin/env python\\n# Fine-tuning script for LLM\"}], \"message\": \"Add fine-tuning script\"} ",
+      "gold": {
+        "query": "LLM fine-tuning scripts"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 0,
+      "specified_agreement": 0.0,
+      "field_results": {
+        "query": false
+      },
+      "case": 16,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"microservices language:go\"} ",
+      "gold": {
+        "query": "microservices in go"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 17,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"kubernetes operators\"} ",
+      "gold": {
+        "query": "kubernetes operators"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 18,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"compiler design in c++\"} ",
+      "gold": {
+        "query": "compiler design in c++"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "query": true
+      },
+      "case": 19,
+      "gold_tool": "search_repositories",
+      "pred_tool": "search_repositories",
+      "routed_ok": true,
+      "hybrid": "{\"query\": \"web scraper\"} ",
+      "gold": {
+        "query": "web scraper"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 2,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true,
+        "private": true
+      },
+      "case": 20,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"secrets-manager\", \"private\": true} ",
+      "gold": {
+        "name": "secrets-manager",
+        "private": true
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 3,
+      "n_correct": 2,
+      "specified_agreement": 0.6666666666666666,
+      "field_results": {
+        "name": true,
+        "private": false,
+        "autoInit": true
+      },
+      "case": 21,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"personal-blog\", \"autoInit\": true} ",
+      "gold": {
+        "name": "personal-blog",
+        "private": false,
+        "autoInit": true
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 22,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"web-crawler\"} ",
+      "gold": {
+        "name": "web-crawler"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 23,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"data-science-experiments\", \"autoInit\": true} ",
+      "gold": {
+        "name": "data-science-experiments"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 24,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"task-manager-app\", \"autoInit\": true} ",
+      "gold": {
+        "name": "task-manager-app"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 2,
+      "n_correct": 2,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true,
+        "private": true
+      },
+      "case": 25,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"auth-service\", \"private\": true, \"autoInit\": false} ",
+      "gold": {
+        "name": "auth-service",
+        "private": true
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 26,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"api-gateway-node\", \"autoInit\": true} ",
+      "gold": {
+        "name": "api-gateway-node"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 27,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"chatbot-ui\"} ",
+      "gold": {
+        "name": "chatbot-ui"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 28,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"rust-cli-tool\", \"autoInit\": true} ",
+      "gold": {
+        "name": "rust-cli-tool"
+      }
+    },
+    {
+      "parse_ok": true,
+      "leak": false,
+      "n_specified": 1,
+      "n_correct": 1,
+      "specified_agreement": 1.0,
+      "field_results": {
+        "name": true
+      },
+      "case": 29,
+      "gold_tool": "create_repository",
+      "pred_tool": "create_repository",
+      "routed_ok": true,
+      "hybrid": "{\"name\": \"configuration-files\"} ",
+      "gold": {
+        "name": "configuration-files"
+      }
+    }
+  ],
+  "coref": [
+    {
+      "name": "branch_in_searched_repo",
+      "gold_tool": "create_branch",
+      "pred_tool": "create_branch",
+      "tool_ok": true,
+      "referent": "payment-gateway",
+      "arg_ok": true,
+      "args": "{\"owner\": \"payment-gateway\", \"repo\": \"payment-gateway\", \"branch\": \"hotfix\"} "
+    },
+    {
+      "name": "get_contents_of_named_file",
+      "gold_tool": "get_file_contents",
+      "pred_tool": "get_file_contents",
+      "tool_ok": true,
+      "referent": "deploy.sh",
+      "arg_ok": true,
+      "args": "{\"owner\": \"cloud-infra\", \"repo\": \"cloud-infra\", \"path\": \"deploy.sh\"} "
+    },
+    {
+      "name": "pr_for_prior_repo",
+      "gold_tool": "create_pull_request",
+      "pred_tool": "create_pull_request",
+      "tool_ok": true,
+      "referent": "frontend-ui",
+      "arg_ok": true,
+      "args": "{\"owner\": \"frontend-ui\", \"repo\": \"frontend-ui\", \"title\": \"Update from dev to main\", \"head\": \"dev\", \"base\": \"main\"} "
+    },
+    {
+      "name": "fork_prior_repo",
+      "gold_tool": "fork_repository",
+      "pred_tool": "fork_repository",
+      "tool_ok": true,
+      "referent": "rust-cli-tool",
+      "arg_ok": true,
+      "args": "{\"owner\": \"your_username\", \"repo\": \"rust-cli-tool\"} "
+    },
+    {
+      "name": "issue_in_prior_repo",
+      "gold_tool": "create_issue",
+      "pred_tool": "create_issue",
+      "tool_ok": true,
+      "referent": "api-gateway",
+      "arg_ok": true,
+      "args": "{\"owner\": \"api-gateway\", \"repo\": \"api-gateway\", \"title\": \"crash on startup\"} "
+    }
+  ]
+}

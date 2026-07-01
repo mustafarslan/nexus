@@ -1,0 +1,32 @@
+\section{Introduction}
+\label{sec:introduction}
+
+The emergence of agentic workflows has extended the utility of large language models (LLMs) by enabling autonomous interaction with external environments through structured APIs. Standards such as the Model Context Protocol (MCP)~\cite{anthropic2024mcp} formalize this interaction: prior to each generation step, the serving system injects complete JSON schema specifications detailing function names, arguments, constraints, and descriptions into the context window. The LLM processes this context and generates a structured call conforming to the valid schema format.
+
+Despite its flexibility, this schema-injection paradigm introduces severe computational bottlenecks. Standard Transformer architectures rely on self-attention mechanisms imposing a prefill compute bottleneck that scales quadratically with sequence length ($\mathcal{O}(P^2)$)~\cite{vaswani2017attention}. When agentic systems expose extensive registries of tools (spanning tens to hundreds of function schemas), the combined tool payload easily consumes $10^3$ to $10^5$ tokens. The resulting prefill phase incurs substantial floating-point computation, degrading the Time-to-First-Token (TTFT) and rendering real-time execution intractable. Empirically, full-context injection of a 100-tool registry (~12,500 tokens) produces a median TTFT of 12.35\,s on an Apple M4 Max unified memory workstation, rendering interactive use infeasible.
+
+\subsection{Limitations of Existing Cache Architectures}
+To mitigate redundant prompt evaluation, modern serving systems employ prefix caching and radix-attention indexing (e.g., vLLM~\cite{kwon2023vllm}, SGLang~\cite{zheng2024sglang}). These systems maintain a tree-based index over Key-Value (KV) cache pages to reuse computed activations. However, prefix caching assumes a strict linear prefix starting from the absolute beginning of the sequence ($P=0$). 
+
+In dynamically routed agentic loops, this linear prefix assumption breaks. The target tool schema varies across successive turns, and intermediate user queries, chat histories, or chain-of-thought tokens diverge before the tool definitions are reached. Because different tools occupy the identical positional interval in the context window, the sequence forks. Standard prefix cache managers cannot dynamically splice distinct, mutually exclusive cache blocks into active mid-context positions without discarding downstream states, forcing a complete attention prefill recomputation over the selected schema tokens.
+
+\subsection{The Virtual Memory Analogy}
+We identify a structural analogy between LLM tool schema routing and operating system virtual memory management. The active transformer context window can be modeled as a virtual address space, and individual tool schemas represent independent memory pages managed by a software-based Memory Management Unit (MMU). In physical hardware, the MMU resolves address mappings using a Translation Lookaside Buffer (TLB), walks hierarchical page tables on cache misses, and invokes page-fault handlers to swap pages from secondary storage into main physical memory.
+
+\textsc{Nexus} instantiates this OS design pattern for LLM context management. The system employs:
+\begin{itemize}
+  \item \textbf{An L1 Semantic Lookaside Buffer (SLB):} A hardware-aligned semantic cache that performs SIMD-accelerated linear sweeps over registered tool embeddings to locate the top-$K$ tool candidates in microsecond-scale ($\approx 4.19\,\mu\text{s}$) time.
+  \item \textbf{A Left-Child Right-Sibling (LCRS) Radix Trie FSM:} Acting as a deterministic page table walker that restricts LLM logit output to valid tool namespace tokens.
+  \item \textbf{A Stride-Aware KV Cache Splicer:} Operating as a page fault handler that reads pre-compiled FP16 KV caches from storage (\texttt{.atb} files) into pinned host memory via user-space Direct I/O, blits them directly into unified physical memory, and applies rotary position corrections.
+\end{itemize}
+
+While this virtual memory metaphor provides structural inspiration, it is bounded by physical differences: physical memory pages are independent, whereas transformer Key-Value caches possess causal dependencies governed by Rotary Position Embeddings (RoPE)~\cite{peng2023yarn}. Splicing a pre-compiled KV block into a non-zero position causes phase drift, bounding the physical viability of this splicing model.
+
+\subsection{Contributions}
+To address these challenges, this paper presents the design, implementation, and evaluation of \textsc{Nexus}. We make the following contributions:
+\begin{enumerate}
+  \item \textbf{Dual-Path KV-MMU:} We present a unified memory-aware KV cache management unit that routes operations through two paths: Path A splices memory-mapped attention blocks directly into mid-context slots for short contexts ($P \le 256$) with a fused tail-suffix recomputation, while Path B ($P > 256$) acts as a strict safety net, completely bypassing C++ splicing to fall back to a full text prefill in Python. The L0 Exact-Token Radix Cache is queried first on the hot path for short contexts.
+  \item \textbf{Zero-Allocation L0 Radix Arena:} We introduce a C++23 Left-Child Right-Sibling radix trie FSM operating on flat, cache-aligned arrays with lock-free sequence isolation, achieving logit masking in $5.79\,\mu\text{s}$ with zero dynamic memory allocation.
+  \item \textbf{Representation Engineering for Dense Routing:} We develop "Transient Intent Signatures" to stretch embedding separations in latent dense vector space, calibrated using empirical CDF margins to strictly bound the cross-encoder reranking invocation to a $20\%$ budget.
+  \item \textbf{RoPE Physics Boundaries:} We conduct a mathematical and empirical characterization of position embedding phase drift under splicing, defining the causal isolation constraint and showing why scattered recomputes fail at deep context sizes.
+\end{enumerate}

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "benchmark": "bench_gateway_e2e",
+  "git_sha": "1384a33be3e6efc5f330e5b762060d6b4afe1ded",
+  "hardware": "Darwin 25.5.0 arm64",
+  "timestamp": "2026-06-14T10:57:15Z",
+  "config": {
+    "n_queries": 100,
+    "arm": "GW_route"
+  },
+  "metrics": {},
+  "records": [],
+  "by_arm": {
+    "GW_route": {
+      "n": 100,
+      "tool_accuracy": 0.91,
+      "tool_accuracy_ci": {
+        "low": 0.86,
+        "high": 0.9600000000000001,
+        "point": 0.91,
+        "n": 100
+      },
+      "tool_accuracy_wilson": {
+        "low": 0.8400000000000001,
+        "high": 0.9600000000000001,
+        "point": 0.91,
+        "n": 100
+      },
+      "retrieval_hit_rate": 0.91,
+      "decode_accuracy_given_retrieval_hit": 1.0,
+      "ttft_us_mean": 181225.0,
+      "ttft_us_p50": 171255.35,
+      "ttft_us_p50_ci": {
+        "low": 154129.815,
+        "high": 188380.885,
+        "point": 171255.35,
+        "n": 100
+      },
+      "decode_us_mean": 0.0
+    }
+  }
+}

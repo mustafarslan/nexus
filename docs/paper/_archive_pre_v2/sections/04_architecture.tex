@@ -1,0 +1,59 @@
+\section{System Architecture and C++ Engine Implementation}
+\label{sec:architecture}
+
+The \textsc{Nexus} architecture is designed as a software-defined Memory Management Unit (MMU) that coordinates the layout, lifecycle, and mapping of pre-compiled Key-Value cache pages. It consists of the L1 Semantic Lookaside Buffer (SLB), the Left-Child Right-Sibling (LCRS) Radix Trie FSM, and a Stride-Aware Splicer.
+
+\subsection{The MMU Abstraction and .atb Serialization}
+To decouple tool schema prefill from runtime execution, \textsc{Nexus} serializes each tool schema's Key-Value tensors offline into a binary Aeon Tool Block (\texttt{.atb}) file. Each \texttt{.atb} file contains a strictly packed $128$-byte header followed by contiguous FP16 Key and Value cache payloads. The header specifies the model topology parameters: layer count ($L$), key-value head count ($n_{\text{head\_kv}}$), dimension per head ($d_{\text{head}}$), and schema sequence length ($S$). It includes an FNV-1a topology hash to ensure that the pre-compiled cache matches the active model's architecture.
+
+To eliminate runtime translation walks, \texttt{.atb} payloads are mapped into a pre-pinned physical memory arena. The host allocation system, \texttt{QuantizedBitmapAllocator}, despite its name, is implemented as a Power-of-2 Buddy Allocator using \texttt{BuddyNode} linked lists, managing pages using a HugeTLB-backed physical memory block aligned to $2\,\text{MB}$ boundaries. This layout allows the GPU kernel to resolve pointers directly without paging overhead.
+
+\subsection{The Dual-Path Routing Gate}
+The MMU manages cache mapping through a Dual-Path Gate that routes requests based on the context depth $P$ at which the tool must be injected:
+\begin{itemize}
+  \item \textbf{Path A (POSIX-mapped ATB Splice):} Invoked when context depth $P \le 256$. The splicer maps the pre-compiled \texttt{.atb} cache block directly into the target context and executes a fused tail-suffix recomputation over the final $5\%$ of the schema sequence (governed by the C++ parameter \texttt{recompute\_pct\_} initialized to \texttt{5.0f}) to restore cross-attention coherence.
+  \item \textbf{Path B (Python Text Prefill Bypass):} Invoked when context depth $P > 256$. Because deep contexts induce severe RoPE phase drift that degrades attention fidelity, Path B completely bypasses the C++ splicing engine and prefix cache (returning $0$), falling back to Python for a full text prefill of the schema from scratch via \texttt{decode_tokens}.
+\end{itemize}
+The L0 Exact-Token Radix Cache is queried first on the hot path for short contexts ($P \le 256$) to attempt microsecond-scale warm copy reuse.
+
+The C++ engine implements two distinct LCRS radix structures. The radix FSM (\texttt{NexusRadixFSM}) represents the routing hierarchy using a compact $16$-byte \texttt{RadixNode} structure without an auxiliary token arena:
+\begin{lstlisting}[language=C++]
+struct RadixNode {
+    uint32_t token;
+    uint32_t first_child_idx;
+    uint32_t next_sibling_idx;
+    uint32_t tool_id;
+};
+\end{lstlisting}
+Sibling nodes are grouped sequentially, allowing the traversal of child nodes to execute as sequential linear reads that maximize CPU cache spatial locality. Meanwhile, the prefix cache (\texttt{NexusRadixPrefixCache}) implements a warm radix trie backed by two pre-allocated continuous memory arenas: \texttt{node\_arena\_} stores a $22$-byte packed \texttt{RadixNode} structure (containing token start index, token length, first child index, next sibling index, pool index, and prefix end position), while \texttt{token\_arena\_} stores the actual token sequences to support compressed multi-token edges. LRU ticks and reference counts are maintained separately in a pre-allocated pool slot metadata array (\texttt{pool\_meta\_}). Both arenas are allocated/reserved at initialization and never resized on the hot path, achieving true zero-allocation operation during steady-state inference.
+
+\subsubsection{VRAM Boundary Clamp}
+A critical failure mode in prefix-cache matching occurs when the query matches a prefix of a registered tool name, but diverges before completing it. Without boundary protection, mapping unmatched physical cache pages beyond the valid query length causes out-of-bounds attention values, corrupting the generated sequence.
+
+To prevent this, the L0 Radix engine enforces the \textbf{VRAM Boundary Clamp}. Upon prefix matching, we track the length of the matching token sequence, denoted by $L_{\text{match}}$. The cache manager strictly clamps the active context boundary \texttt{best\_end} to:
+\begin{equation}
+\text{best\_end} = \min\left( \text{matched\_query\_len}, L_{\text{match}} \right).
+\end{equation}
+By truncating the virtual cache boundary to the exact matched query token sequence, the attention mechanism is restricted from accessing downstream unmatched schema locations, preventing memory safety violations and ensuring structural fidelity.
+
+\subsection{Concurrency Control and Thread Safety}
+Concurrent access is managed through three key mechanisms matching the codebase implementation:
+
+\begin{itemize}
+  \item \textbf{Lock Synchronization:} The warm cache radix trie (\texttt{NexusRadixPrefixCache}) utilizes a readers-writer lock (\texttt{std::shared\_mutex trie\_rw\_lock\_}) to serialize trie updates (write lock) while allowing concurrent prefix matching (shared read lock). Mutex protection via a standard \texttt{std::mutex trie\_mutex\_} is used to synchronize mutations (adding routes) in the radix FSM (\texttt{NexusRadixFSM}).
+  \item \textbf{Disjoint Sequence Isolation and Flat Arena Reads:} On the generation hot path, concurrent queries to the FSM operate on disjoint sequence slots indexed by sequence ID (\texttt{seq\_id}), avoiding locks entirely. Traversals of the radix trie read the flat node array without locks; this is safe under the assumption that the trie's capacity is fully pre-allocated/reserved at initialization. If a trie mutation forces vector reallocation, a theoretical data race could occur.
+  \item \textbf{Lock-Free Hazard Pointers:} For block cache residency protection, Nexus implements thread-local hazard pointers (\texttt{HazardSlot}) mapping up to 128 concurrent threads (\texttt{MAX\_THREADS = 128}), allowing lock-free reads of memory-mapped attention block tensors.
+\end{itemize}
+
+To prevent cache-line invalidation storms under unified memory interconnects, per-sequence states are aligned to $128$-byte boundaries using \texttt{alignas(128)}. This alignment matches the cache-line width of modern unified fabrics (such as the Apple M4 Max L2 cache sectors), isolating active reader updates and preventing false sharing bus stalls.
+
+\subsection{Zero-Copy Memory Mapping and Prefetching}
+On Apple Silicon unified memory architectures (UMA), the CPU and GPU share a single physical address space. \textsc{Nexus} exploits this by mapping \texttt{.atb} files directly into memory via POSIX `mmap` with Direct I/O flags (\texttt{F\_NOCACHE} on macOS, \texttt{O\_DIRECT} on Linux). 
+
+This zero-copy mapping allows the GPU's Metal Command Buffer to reference the host-allocated physical pointers directly, seamlessly delegating the host pointer mapping to \texttt{llama.cpp}'s underlying Metal backend, which internally leverages Apple Metal's \texttt{newBufferWithBytesNoCopy} API for zero-copy UMA execution. The splicer executes a $2\text{D}$ memory blit using stride-aligned tensor copies, avoiding PCIe DMA transfers.
+
+To hide physical mapping latencies, the system runs an asynchronous prefetching pipeline. During Stage 1 (query tokenization), the L1 SLB executes an INT8 dot-product scan. If the top candidate's score exceeds $T_{\text{spec}} = 0.88$ and the confidence margin satisfies $\Delta_{\text{confidence}} \ge 0.10$, the MMU issues an asynchronous \texttt{posix\_madvise} residency hint and initiates a speculative background load. This load runs in parallel with Stage 2 (FSM token evaluation), hiding the storage I/O latency behind FSM validation:
+\begin{equation}
+T_{\text{hidden}} = \min\left( T_{\text{DMA}}, T_{\text{FSM}} \right)
+\end{equation}
+where $T_{\text{DMA}}$ is the background transfer duration and $T_{\text{FSM}}$ is the FSM verification latency.

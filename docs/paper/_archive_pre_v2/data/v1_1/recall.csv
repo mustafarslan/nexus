@@ -1,0 +1,8 @@
+# GENERATED from results/v1.1_canonical/ by regen_canonical_paper_data.py. TRUE TTFT (incl. first token) unless noted.
+metric,value
+dense_recall_at_1,0.87
+dense_recall_at_5,0.99
+ce_recall_at_1,0.88
+ce_fire_fraction,0.2
+margin_threshold,0.013646852970123292
+meets_target_0.90,False

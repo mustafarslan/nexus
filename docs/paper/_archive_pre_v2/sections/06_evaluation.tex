@@ -1,0 +1,86 @@
+\section{Experimental Evaluation}
+\label{sec:evaluation}
+
+We evaluate the performance of \textsc{Nexus} on an Apple M4 Max workstation equipped with $16$ CPU cores, $40$ GPU cores, and $128\,\text{GB}$ of unified memory running macOS Sequoia and the Metal API. Our evaluation uses Qwen2.5-14B-Instruct quantized to Q4\_K\_M as the base generative model, and Nomic-Embed-Text-v1.5 as the dense embedding model. The evaluation suite runs over a hold-out test set consisting of $100$ queries mapping to $10$ complex GitHub MCP tool schemas.
+
+We organize our evaluation around four key research questions:
+\begin{itemize}
+  \item \textbf{RQ1 (Macro Performance):} How does \textsc{Nexus} compare against standard baselines in terms of end-to-end Time-to-First-Token (TTFT) latency and tool-routing accuracy?
+  \item \textbf{RQ2 (Micro Latency Waterfall):} What is the latency contribution of each stage in the context routing and splicing lifecycle?
+  \item \textbf{RQ3 (Registry Scalability):} How does the system scale as the number of registered tools increases to $1000$?
+  \item \textbf{RQ4 (Ablation Analysis):} What are the performance benefits of Intent Signatures and statistical margin calibration?
+\end{itemize}
+
+\input{tables/PAPER_TABLES.tex}
+
+\subsection{RQ1: Macro Performance}
+We compare \textsc{Nexus} against two standard baselines:
+\begin{enumerate}
+  \item \textbf{Full-Context Concatenation ($B_{FC}$):} Appends all available tool schemas directly to the context window, forcing a full attention prefill over all definitions.
+  \item \textbf{Standard Retrieve-and-Prefill ($B_{RP}$):} Employs a dense retriever to select the single most relevant tool schema and pre-fills its text description online on every query.
+\end{enumerate}
+
+\Cref{tab:e2e-macro} reports the end-to-end latency and accuracy results. The Full-Context Concatenation ($B_{FC}$) baseline achieves $98.0\%$ accuracy but suffers from a TTFT P50 of $12.35\,\text{s}$ ($12345.67\,\text{ms}$), making interactive serving impossible. The Retrieve-and-Prefill ($B_{RP}$) baseline reduces TTFT P50 to $1.50\,\text{s}$ ($1498.63\,\text{ms}$) with $92.0\%$ accuracy. 
+
+In comparison, \textsc{Nexus} achieves a gateway \emph{routing+splice} latency P50 of $\approx 160\,\text{ms}$ (regenerated 2026-06-20; $n{=}500$, $\sigma{=}0.6$\,ms) at $89.0\%$ tool-routing accuracy. \textbf{Caveat:} this gateway figure measures routing+splice only and excludes first-token generation (\texttt{decode\_us}$=0$); it is \emph{not} TTFT. The earlier $6.3\times$ / $52\times$ ratios divided this routing-only latency by the \emph{full-TTFT} baselines and are therefore not like-for-like. Measured consistently (end-to-end TTFT incl.\ first token, the $N1x$ arm: $518\,\text{ms}$ vs.\ $B_{RP}$'s $1214\,\text{ms}$, clean serial $n{=}30$), \textsc{Nexus} is $\approx 2.34\times$ faster than $B_{RP}$, with a $\approx 3$-point accuracy trade-off ($0.89$ vs.\ $0.92$), the two within overlapping $95\%$ confidence intervals.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_e2e_cdf.pdf}
+  \caption{End-to-end TTFT cumulative distribution function (CDF) on log-scale. \textsc{Nexus} maintains sub-399\,ms TTFT up to the P99 percentile, dominating both baselines.}
+  \label{fig:e2e-cdf}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_pareto_frontier.pdf}
+  \caption{Accuracy vs.\ TTFT P50 Pareto frontier. \textsc{Nexus} provides an optimal trade-off, shifting the latency envelope by an order of magnitude.}
+  \label{fig:pareto}
+\end{figure*}
+
+\Cref{fig:e2e-cdf} displays the cumulative distribution of TTFT, showing that \textsc{Nexus} maintains a tight, predictable latency distribution. \Cref{fig:pareto} shows the accuracy--latency Pareto frontier, illustrating that \textsc{Nexus} dominates the baseline approaches on the latency axis while preserving routing accuracy.
+
+\subsection{RQ2: Micro Latency Waterfall}
+To isolate the sources of latency, we analyze the execution times of the individual stages in the routing and splicing lifecycle. \Cref{fig:waterfall} decomposes the TTFT of the \textsc{Nexus} splicing path (Path A).
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_ttft_waterfall.pdf}
+  \caption{Time-to-First-Token compute waterfall breakdown for the \textsc{Nexus} splicing path (Path A).}
+  \label{fig:waterfall}
+\end{figure*}
+
+The microsecond-scale stages execute on the C++ host with zero heap allocations, demonstrating that the MMU routing overhead ($<8\,\mu\text{s}$ combined SLB and L0 exact-token copy) constitutes $< 0.1\%$ of the end-to-end TTFT. Specifically, the L1 SLB embedding scan requires $4.19\,\mu\text{s}$, the L0 exact-token radix copy requires $3.04\,\mu\text{s}$, and LCRS FSM logit masking consumes $5.79\,\mu\text{s}$. 
+
+The stack latency is dominated by:
+\begin{itemize}
+  \item \textbf{Tokenization and Intent Signatures:} $0.16\,\text{ms}$ ($162.90\,\mu\text{s}$).
+  \item \textbf{Dense Embedding Generation:} $22.61\,\text{ms}$ ($22614.00\,\mu\text{s}$).
+  \item \textbf{Cross-Encoder Reranking (Amortized):} $0.69\,\text{ms}$ ($690.75\,\mu\text{s}$), where the raw execution is $3.45\,\text{ms}$ ($3453.77\,\mu\text{s}$) but is invoked on only $20\%$ of queries.
+  \item \textbf{Causal Suffix Recomputation:} $180.84\,\text{ms}$ ($180840.54\,\mu\text{s}$), representing the Metal attention prefill over the $5\%$ suffix tokens required to repair RoPE drift.
+\end{itemize}
+The total stacked latency is $207.76\,\text{ms}$, which corresponds to the warm splicing path latency.
+
+\subsubsection{L0 Radix Trie Microbenchmark}
+\Cref{tab:l0-radix} evaluates the performance of the L0 Radix trie arena. The exact-token radix match achieves a hit rate of $69.5\%$ with a fragmentation of $30.5\%$. Splicing the matched prefix cache requires a copy latency of only $3.04\,\mu\text{s}$ at P50 and $11.18\,\mu\text{s}$ at P99, representing a microsecond-scale warm path. In contrast, simulated $32$-token fixed chunking (graveyard) achieves a $0.0\%$ hit rate due to alignment mismatch, exposing $100\%$ fragmentation and forcing full text prefill.
+
+\subsection{RQ3: Registry Scalability}
+We evaluate the scalability of the L1 Semantic Lookaside Buffer by increasing the registry size $N$ from $10$ to $1000$ tools. As shown in \Cref{tab:scalability} and \Cref{fig:scalability}, the SLB scan latency scales sub-linearly due to SIMD NEON/VNNI vectorization, rising from $1.67\,\mu\text{s}$ at $N=10$ to $21.50\,\mu\text{s}$ at $N=1000$. 
+
+The memory footprint of the dense vector index scales linearly but remains negligible, consuming only $3.78\,\text{MB}$ at $N=1000$. Most importantly, the end-to-end TTFT remains flat around $208.01\,\text{ms}$, proving that registry size does not impact downstream inference latency.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_scalability.pdf}
+  \caption{L1 SLB scan latency ($\mu$s) and memory footprint (MB) vs.\ the number of registered tools $N$.}
+  \label{fig:scalability}
+\end{figure*}
+
+\subsection{RQ4: Ablation Analysis}
+\Cref{tab:ml-ablation} summarizes the performance impact of our machine learning co-design components:
+\begin{itemize}
+  \item \textbf{Nexus Dense Only:} Bypasses the Cross-Encoder entirely, relying solely on the L1 SLB. It achieves a TTFT P50 of $248.71\,\text{ms}$ (P99 of $625.77\,\text{ms}$) but degrades accuracy to $87.0\%$.
+  \item \textbf{Nexus v0 Uncalibrated:} Employs a non-calibrated margin threshold. The Cross-Encoder is invoked on $15\%$ of queries, yielding $85.0\%$ accuracy and a TTFT P50 of $292.02\,\text{ms}$.
+  \item \textbf{Nexus v1 Production:} Employs Intent Signatures and the $P_{20}$-calibrated margin gate ($\tau \approx 0.01365$). The Cross-Encoder is invoked on $20\%$ of queries, restoring accuracy to $89.0\%$ with a TTFT P50 of $307.93\,\text{ms}$ (P99 of $523.39\,\text{ms}$).
+\end{itemize}
+These results demonstrate that the combination of intent signatures and calibrated margin gating is essential to achieve high routing accuracy without incurring excessive latency overhead.

@@ -1,0 +1,45 @@
+{
+  "bundle": "v2.0_canonical",
+  "purpose": "Sole evidence root for the Nexus v2.0 IEEE paper. Every number in docs/paper/main.tex must trace to a file under raw/.",
+  "created": "2026-07-01",
+  "provenance": {
+    "git_sha": "1ce4aa4364ce38f5972311792ec56481a2e90399",
+    "git_head_desc": "feat: Phase 2 - cache-line alignment, transposed-V UMA splicing, and deep-splice routing",
+    "llama_cpp_sha": "cb2463bb9f093d7bcaf3194988a8251234fabb69",
+    "hardware": "Apple M4 Max, Darwin 25.5.0 arm64, unified memory (UMA/Metal)",
+    "python": ".venv/bin/python (3.14)"
+  },
+  "models": {
+    "chat": {
+      "name": "Qwen2.5-14B-Instruct",
+      "quant": "Q4_K_M",
+      "path": "/Volumes/AI_SSD/models/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf",
+      "sha256_prefix": "a09ea5e7b1eafb1b"
+    },
+    "embedder": {
+      "name": "nomic-embed-text-v1.5",
+      "format": "GGUF f16",
+      "dim": 768,
+      "query_prefix": "search_query: ",
+      "doc_prefix": "search_document: "
+    },
+    "reranker": {
+      "name": "cross-encoder/ms-marco-MiniLM-L-6-v2 (finetuned v3)",
+      "path": "results/tool_cross_encoder_finetuned_v3/"
+    },
+    "softcap_probe": {
+      "name": "gemma-2-9b-it",
+      "note": "used for transposed-V (v_trans) splice fidelity; llama.cpp asserts on gemma-2-2b"
+    }
+  },
+  "artifacts": {
+    "raw/": "One JSON per headline measurement, each stamped with git_sha, n, seed, percentiles, and CI where n permits.",
+    "figures/": "Regenerated empirical plot PDFs consumed by the paper.",
+    "EVIDENCE_LEDGER.csv": "claim -> code_symbol(file:line) -> artifact -> value/n/ci/evidence_class (Phase 2).",
+    "REFERENCE_AUDIT.csv": "Per-reference verification against a primary source (Phase 4b)."
+  },
+  "notes": [
+    "Pre-v2 result bundles (v1.1_canonical, v1.x_sidecar_canonical, quarantine, empty routing placeholders, Run-A/B) were moved to results/_archive_pre_v2/ and are NOT cited by the paper.",
+    "v2_phase3_vtrans/ holds the original v2.0 capstone + go/no-go markdown (source of truth to be reproduced into raw/ JSON)."
+  ]
+}

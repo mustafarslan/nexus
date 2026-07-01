@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "benchmark": "bench_v2_capstone_deep_splice_ttft",
+  "git_sha": "1ce4aa4364ce38f5972311792ec56481a2e90399",
+  "llama_cpp_sha": "cb2463bb9f093d7bcaf3194988a8251234fabb69",
+  "hardware": "Darwin 25.5.0 arm64 (UMA/Metal)",
+  "timestamp": "2026-07-01T06:40:45Z",
+  "config": {
+    "model": "qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf",
+    "trials": 15,
+    "schema_len": 270,
+    "query_len": 67,
+    "p_starts": [
+      256,
+      512,
+      1024,
+      2048
+    ],
+    "full_mults": [
+      4.0,
+      16.0
+    ],
+    "max_splice_pos": 256,
+    "base_recompute_pct": 5.0
+  },
+  "curves": {
+    "full_mult_4": [
+      {
+        "p_start": 256,
+        "eff_pct": 5.0,
+        "prefill_ms_median": 3278.1429579481483,
+        "prefill_ms_ci95": [
+          3265.000541927293,
+          3295.9614591673017
+        ],
+        "splice_ms_median": 2010.0902921985835,
+        "splice_ms_ci95": [
+          1974.0490182186477,
+          2020.116833038628
+        ],
+        "speedup": 1.6308436345725557,
+        "top1_agree": 1,
+        "kl_nats": 0.00017788721186668728
+      },
+      {
+        "p_start": 512,
+        "eff_pct": 36.7,
+        "prefill_ms_median": 4671.812375076115,
+        "prefill_ms_ci95": [
+          4655.09779099375,
+          4691.849790979177
+        ],
+        "splice_ms_median": 3761.198709020391,
+        "splice_ms_ci95": [
+          3755.9184581041336,
+          3769.9186250101775
+        ],
+        "speedup": 1.2421073004922132,
+        "top1_agree": 1,
+        "kl_nats": 0.00017785978533572583
+      },
+      {
+        "p_start": 1024,
+        "eff_pct": 100.0,
+        "prefill_ms_median": 7301.939125172794,
+        "prefill_ms_ci95": [
+          7281.965082976967,
+          7317.560666007921
+        ],
+        "splice_ms_median": 7425.475042080507,
+        "splice_ms_ci95": [
+          7341.980042168871,
+          7529.201209079474
+        ],
+        "speedup": 0.983363230472444,
+        "top1_agree": 1,
+        "kl_nats": 0.0
+      },
+      {
+        "p_start": 2048,
+        "eff_pct": 100.0,
+        "prefill_ms_median": 13091.85666590929,
+        "prefill_ms_ci95": [
+          13075.8132499177,
+          13109.739948710194
+        ],
+        "splice_ms_median": 13141.760790953413,
+        "splice_ms_ci95": [
+          13104.765041032806,
+          13149.450541939586
+        ],
+        "speedup": 0.9962026302382192,
+        "top1_agree": 1,
+        "kl_nats": 0.0
+      }
+    ],
+    "full_mult_16": [
+      {
+        "p_start": 256,
+        "eff_pct": 5.0,
+        "prefill_ms_median": 3326.7915421165526,
+        "prefill_ms_ci95": [
+          3319.555416936055,
+          3338.9655421487987
+        ],
+        "splice_ms_median": 1924.2466669529676,
+        "splice_ms_ci95": [
+          1908.763499930501,
+          1932.3482080362737
+        ],
+        "speedup": 1.7288799815797555,
+        "top1_agree": 1,
+        "kl_nats": 0.00017788721186668728
+      },
+      {
+        "p_start": 512,
+        "eff_pct": 11.3,
+        "prefill_ms_median": 4747.220915975049,
+        "prefill_ms_ci95": [
+          4742.8423329256475,
+          4753.504249965772
+        ],
+        "splice_ms_median": 3335.512249963358,
+        "splice_ms_ci95": [
+          3326.434499816969,
+          3344.8961661197245
+        ],
+        "speedup": 1.423235941054391,
+        "top1_agree": 1,
+        "kl_nats": 0.00017067114793599674
+      },
+      {
+        "p_start": 1024,
+        "eff_pct": 24.0,
+        "prefill_ms_median": 7624.998792074621,
+        "prefill_ms_ci95": [
+          7573.827042011544,
+          7721.273500006646
+        ],
+        "splice_ms_median": 6531.9966659881175,
+        "splice_ms_ci95": [
+          6503.268125001341,
+          6655.310375150293
+        ],
+        "speedup": 1.1673304782560174,
+        "top1_agree": 1,
+        "kl_nats": 0.00011712719279020918
+      },
+      {
+        "p_start": 2048,
+        "eff_pct": 49.3,
+        "prefill_ms_median": 13468.258708016947,
+        "prefill_ms_ci95": [
+          13280.849792063236,
+          13587.050315970537
+        ],
+        "splice_ms_median": 12620.217165909708,
+        "splice_ms_ci95": [
+          12572.101083118469,
+          13085.997791960835
+        ],
+        "speedup": 1.0671970641201014,
+        "top1_agree": 1,
+        "kl_nats": 0.001155092957990669
+      }
+    ]
+  }
+}

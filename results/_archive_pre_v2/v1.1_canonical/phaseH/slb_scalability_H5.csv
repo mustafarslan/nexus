@@ -1,0 +1,6 @@
+n_tools,slb_scan_p50_us,slb_scan_p99_us,memory_mb,e2e_ttft_p50_ms,e2e_ttft_p99_ms,n_e2e_queries,dummy_atb
+10,1.375,4.606,0.04,170.935,232.289,10,dummy_shared.atb
+50,2.625,5.178,0.19,161.673,272.723,10,dummy_shared.atb
+100,3.708,10.061,0.38,172.569,269.133,10,dummy_shared.atb
+500,10.791,17.587,1.89,172.729,323.459,10,dummy_shared.atb
+1000,21.125,33.619,3.78,161.646,261.754,10,dummy_shared.atb

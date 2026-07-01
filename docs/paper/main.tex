@@ -108,7 +108,7 @@ contributions, tagged by evidence class:
   RoPE fidelity boundary and the failure of reference-free drift gating (\S\ref{sec:limits}).
 \end{enumerate}
 
-We are explicit about scope. All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. The transposed-V splice mechanism is additionally implemented and fidelity-tested on a second, soft-capped model (\code{Gemma-2-9B}). However, the physical splicing mechanism is strictly limited to local execution of flash-attention-compatible, non-soft-capped GGUF architectures. Splicing cannot execute under local \code{Gemma4} execution (due to soft-capping forcing a transposed layout that the splicer rejects, and loading errors under the pinned \code{llama.cpp} version) or cloud execution (due to the physical nature of cache transplantation requiring direct memory copies into local physical cache addresses). Soft-capped and cloud models must fall back entirely to text-prefill (Path B, yielding a $1.0\times$ speedup). Sample sizes are small ($n\!\le\!30$ for end-to-end arms), and the deep splice is validated at the fidelity-and-latency level, not as a multi-turn production path. We view the negative results and the measured envelope as the durable contribution.
+We are explicit about scope. All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. The transposed-V splice mechanism is additionally implemented and fidelity-tested on a second, soft-capped model (\code{Gemma-2-9B}); that Gemma fidelity check lies outside the committed v2.0 artifact bundle. Physical splicing requires direct copies into local physical cache addresses, so it runs only for local, UMA-resident execution; cloud/remote APIs (which accept only text token streams) and discrete-GPU back-ends fall back entirely to text-prefill (Path~B, $1.0\times$ speedup). The precise architectural boundary is detailed in \S\ref{sec:vtrans}. Sample sizes are small ($n\!\le\!30$ for end-to-end arms), and the deep splice is validated at the fidelity-and-latency level, not as a multi-turn production path. We view the negative results and the measured envelope as the durable contribution.
 
 Three research questions organize the paper. \textbf{RQ1}: how far can a relocated schema block be
 trusted before its next-token distribution departs from a full prefill (\S\ref{sec:limits})?
@@ -117,7 +117,9 @@ routing and argument generation avoid the splice path entirely (\S\ref{sec:arch}
 \S\ref{sec:eval})?
 
 \emph{Artifact availability.} Every reported number traces to a committed artifact under
-\code{results/v2.0\_canonical/} at git \code{1ce4aa4} (\code{llama.cpp cb2463bb}), for the model
+\code{results/v2.0\_canonical/} at git \code{1ce4aa4} (\code{llama.cpp cb2463bb})---with the sole
+exception of the placement-offset $D_{\mathrm{KL}}$ sweep of Fig.~\ref{fig:dkl}, regenerated at
+\code{5d43008}---for the model
 tuple \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. The artifact bundle
 is available from the author on request pending release; a public archive with a DOI will be added
 on publication.
@@ -214,8 +216,21 @@ $(n_{\mathrm{past}}-m_0)$ and is non-uniform across dimensions (high-frequency p
 fastest), so a pre-compiled schema block is faithful only in a neighborhood of its compile
 anchor. The codebase makes this boundary concrete: the splicer computes
 \code{delta\_pos = n\_past - header->base\_pos} (\code{nexus\_kv\_splicer.cpp}), and the
-orchestrator declines a bare splice once $n_{\mathrm{past}}$ exceeds
-\code{MAX\_SPLICE\_POS}${}=256$ (\code{nexus\_orchestrator.cpp}).
+orchestrator declines a bare splice once $n_{\mathrm{past}}$ exceeds the splice cap
+\code{max\_splice\_pos\_}${}=256$ (\code{nexus\_orchestrator.cpp}; surfaced as \code{MAX\_SPLICE\_POS}
+in the Python agent).
+
+Nexus counteracts the bulk of this error at splice time by \emph{reanchoring}: each
+transplanted key is re-rotated from its compile anchor $m_0$ to the runtime position
+$n_{\mathrm{past}}$---the exact inverse of the offset $\Delta\theta_i$ in
+\eqref{eq:drift}---so that subsequent queries read the relocated block on-axis rather than
+off it. Reanchoring recovers the \emph{relative} query--key rotation exactly, but the block's
+keys and values were compiled under a different preceding context, so a small residual
+divergence survives the correction. That residual---not the raw drift of \eqref{eq:drift}---is
+what \S\ref{sec:limits} measures (the ${\sim}10^{-2}$-nat band of Fig.~\ref{fig:dkl}), and it
+is what the depth-adaptive repair below drives to zero. This is why an off-anchor splice drifts
+\emph{slightly} rather than catastrophically, and why the $256$-token boundary is a repair-start
+rather than a hard failure point.
 
 \subsection{Depth-Adaptive Recompute}
 Rather than treat $256$ as a hard wall, Nexus repairs drift by re-decoding the trailing tokens
@@ -265,9 +280,17 @@ $D_{\mathrm{KL}}\approx 5.7$~nats (\code{rope\_boundary\_gate.json})---two order
 recompute thus actively corrupted the distribution rather than repairing it, which is precisely why
 the current design repairs a \emph{contiguous} trailing suffix and why that mechanism is retired.
 The production splicer still blocks bare splices beyond $n_{\mathrm{past}}=256$ and escalates the
-repair fraction of \eqref{eq:adaptive} with depth: the bare drift is small but nonzero, and the
-depth-adaptive redecode drives it to exactly $0$ (Table~\ref{tab:perf}), trading a little TTFT for a
-hard never-regress fidelity guarantee rather than merely a small residual.
+repair fraction of \eqref{eq:adaptive} with depth. This raises a fair question: if the contiguous
+bare splice already holds top-1 agreement $=1.0$ out to $\Delta\mathrm{pos}=2048$
+(Fig.~\ref{fig:dkl}), why repair at all? Because top-1 agreement is a weaker property than
+distributional identity. The residual ${\sim}10^{-2}$-nat divergence leaves the tail of the
+next-token distribution perturbed, so under temperature or nucleus sampling the spliced and
+prefilled paths can still diverge, and that per-token gap compounds across the many turns of an
+agentic trajectory. Driving the divergence to \emph{exactly} $0$ (Table~\ref{tab:perf}) makes the
+spliced output bit-identical to a full prefill---a guarantee that is auditable and holds under any
+decoding parameters---which is what ``never-regress'' certifies. The depth-adaptive redecode buys
+that hard guarantee for a little TTFT, rather than accepting a small-but-nonzero residual whose
+downstream effect is workload-dependent.
 
 \begin{figure}[t]
 \centering
@@ -433,7 +456,8 @@ e.g.\ \code{create\_repository(name: string, private?: boolean)}. At a median of
 is far smaller than the full schema, so the main-context prefill avoids schema bloat while
 retaining enough semantics to bind arguments to the correct fields---and, on the routed cases,
 fills $100\%$ of query-specified arguments correctly (\S\ref{sec:eval}). A finite-state machine
-masks logits to the tool-name radix trie and to a JSON grammar (\code{nexus\_fsm.cpp}).
+masks logits to the tool-name radix trie (\code{nexus\_fsm.cpp}); JSON arguments are then constrained
+by a native GBNF grammar compiled from the schema (\code{nexus\_agent.py}).
 
 %% ============================================================
 \section{Systems Implementation}
@@ -458,7 +482,14 @@ cannot address this layout. Nexus implements a layout-aware \code{splice\_v\_lay
 cache under UMA, validates the live V strides before writing, and is fidelity-tested on the
 soft-capped \code{Gemma-2-9B} model. On non-UMA / discrete-GPU
 back-ends, where a transposed strided host-to-device transfer would be pathological, the splicer
-declines and the system falls back to prefill---a deliberate safety boundary, not a general path. Consequently, the physical splicing mechanism is fundamentally restricted to local execution of GGUF models that are flash-attention-compatible and non-soft-capped (such as \code{Qwen2.5}). Splicing cannot execute under local \code{Gemma4} execution (due to soft-capping forcing a transposed layout that the splicer rejects, and loading errors under the pinned \code{llama.cpp} version) or cloud execution (due to the physical nature of cache transplantation requiring direct memory copies into local physical cache addresses). Soft-capped and cloud models must fall back entirely to text-prefill (Path B, yielding a $1.0\times$ speedup).
+declines and the system falls back to prefill---a deliberate safety boundary, not a general path.
+The splice path therefore covers two GGUF regimes under local UMA: FlashAttention-compatible models
+with a row-major V cache (e.g.\ \code{Qwen2.5}), spliced directly, and soft-capped models with a
+transposed V cache (e.g.\ \code{Gemma-2-9B}), spliced via the layout-aware routine above. Two cases
+fall back entirely to text-prefill (Path~B, $1.0\times$ speedup): cloud/remote execution, because
+cache transplantation requires direct copies into local physical cache addresses that a token-stream
+API does not expose; and discrete-GPU back-ends, where a transposed strided host-to-device transfer
+would be pathological and the splicer declines by design.
 
 \begin{figure}[t]
 \centering
@@ -519,7 +550,9 @@ pre-reserved arena (\code{llama\_kv\_cache\_seq\_cp}) rather than allocating on 
 \section{Evaluation}
 \label{sec:eval}
 %% ============================================================
-All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. Sample sizes are stated per result; they are small, and we treat the numbers as an envelope rather than a population estimate. To make that framing concrete rather than a disclaimer, every headline proportion carries a Wilson $95\%$ interval and every TTFT median a bootstrap $95\%$ interval (the deep-splice cells use $n{=}15$ trials); speedup intervals propagate the prefill and splice median CIs. We emphasize that all quantitative evaluation is restricted to this local, flash-attention-compatible, non-soft-capped configuration. Physical splicing is architecturally incompatible with remote cloud APIs (which accept only text token streams) and local soft-capped layouts (e.g., \code{Gemma4}) that disable FlashAttention and require transposed V-cache storage; these execute with zero system acceleration, falling back to standard text prefills.
+All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. Sample sizes are stated per result; they are small, and we treat the numbers as an envelope rather than a population estimate. To make that framing concrete rather than a disclaimer, every headline proportion carries a Wilson $95\%$ interval and every TTFT median a bootstrap $95\%$ interval (the deep-splice cells use $n{=}15$ trials); speedup intervals propagate the prefill and splice median CIs. All quantitative splice
+evaluation is restricted to the local, UMA-resident configuration of \S\ref{sec:vtrans};
+back-ends outside that boundary fall back to text prefill with zero splice acceleration.
 
 \subsection{Depth-Adaptive Splice: TTFT and Never-Regress}
 Table~\ref{tab:perf} reports median TTFT of the deep splice against a full text-prefill baseline,
@@ -597,7 +630,9 @@ suffix; both converge to parity as $R(n_{\mathrm{past}})\!\to\!100\%$.}
 \subsection{Routing Accuracy and Registry Scale}
 Routing is evaluated over $100$ GitHub-MCP queries as the registry scales from $N=10$ to $N=250$
 tools (\code{routing\_accuracy\_n250.json}). End-to-end routing accuracy is nearly flat with scale:
-$92\%$, $90\%$, $89\%$, $89\%$ at $N=10,50,100,250$ (Fig.~\ref{fig:route}); at $N=250$ the routing
+$92\%$, $90\%$, $89\%$, $89\%$ at $N=10,50,100,250$ (Fig.~\ref{fig:route})---a spread that sits
+within overlapping Wilson $95\%$ intervals, so ``nearly flat'' is a statement about the interval
+band, not a claim that scale leaves accuracy strictly unchanged; at $N=250$ the routing
 accuracy carries a Wilson $95\%$ CI of $[81.4, 93.7]$ ($n{=}100$), with SLB top-1 recall
 $74\%$ $[64.6, 81.6]$ and top-3 recall $95\%$ $[88.8, 97.8]$. The contrast with the
 concatenate-all-schemas oracle is
@@ -612,8 +647,9 @@ tool vectors completes in \SI{17.6}{\micro\second} (median, including the Python
 \code{routing\_accuracy\_n250.json}), while the pure C++ SIMD dot-product scan over $250$ unit-norm
 vectors runs in \SI{8.25}{\micro\second} (median; \code{slb\_latency.json}). Registering the tool
 name alongside its
-description under the \code{nomic} prefixes is what makes retrieval scale; without it, top-1 recall at
-$N=250$ collapses. Table~\ref{tab:micro} summarizes routing and micro-costs.
+description under the \code{nomic} prefixes is what makes retrieval scale: the tool name carries the
+dominant routing signal, so omitting it degrades top-1 recall (a design rationale; no name-ablation
+artifact is included in the v2.0 bundle). Table~\ref{tab:micro} summarizes routing and micro-costs.
 
 \begin{figure}[b]
 \centering
@@ -681,7 +717,7 @@ End-to-end argument accuracy ($n{=}50$ args)  & 80\,\% {\scriptsize[67.0,\,88.8]
 JSON validity rate ($n{=}30$)                & 100\,\% {\scriptsize(${\ge}88.6$)} \\
 IR length, median / p99                      & 19 / 32 tok \\
 Cross-encoder gate $\tau$ (P20)              & 0.0136 \\
-Gate fire rate                               & 20.3\,\% \\
+Gate fire rate (at $\tau{=}0.0136$)          & 20.8\,\% \\
 Reference-free gate Spearman $\rho$          & 0.193 \\
 \bottomrule
 \end{tabular}

@@ -1,0 +1,6 @@
+eq_label,location,type,symbols_defined,matches_impl,overinterpreted,decision,notes
+eq:attention,II.A,definitional,"Q,K,V,n,d_head,d_model,L all defined",yes,no (now),KEEP,"Standard self-attention; used only to motivate O(n^2) cost. Added explicit 'definitional, not a new bound' qualifier."
+eq:rope-drift,II.B,definitional,"theta_i, n_past, m0, b, d, i defined; base b=1e6 matches model",yes,was over-interpreted,KEEP_BUT_QUALIFY,"Delta theta = (n_past-m0) theta_i. Now explicitly: definitional consequence of RoPE, NOT an empirical predictor of the KL values in Table physics. Notation normalized to n_past/m0 consistently."
+inline O(n^2 d_model L),II.A,definitional,"n,d_model,L",yes,no,KEEP,"Kept as inline text, not display eq; consistent with eq:attention."
+eq:intent-signature,V.A,conceptual heuristic,"E, s_intent, d_tool, t_intent, oplus defined",n/a (heuristic),was implied algebraic,KEEP_BUT_LABEL,"Now explicitly 'conceptual heuristic, not measured or algebraic identity; presented to describe intent, not as evidence'."
+removed: theta_i = 1e6^{-2i/d} as standalone,II.B,definitional,b normalized,yes,no,MERGED,"Folded into eq:rope-drift text with base b=1e6 stated once."

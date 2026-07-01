@@ -1,0 +1,111 @@
+{
+  "manifest_version": "1.1",
+  "frozen_at": "2026-06-20",
+  "supersedes": ["results/*.json (git 1384a33b, Run A)", "docs/paper/data/_raw/* (git 3ea7441, Run B)"],
+  "provenance": {
+    "git_sha": "3ea7441ef7f7834475e063df56ceec457f6070ba",
+    "host": "Mustafas-MacBook-Pro Darwin 25.5.0 arm64 (Apple Silicon T6041)",
+    "python": "3.14.4 (.venv)",
+    "llama_cpp": "0.2.83",
+    "llama_cpp_build_sha": "cb2463bb9f093d7bcaf3194988a8251234fabb69",
+    "model": "Qwen2.5-14B-Instruct Q4_K_M (3-shard GGUF)",
+    "model_hash": "a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68",
+    "embed_model": "nomic-embed-text-v1.5.f16.gguf",
+    "ce_checkpoint": "results/tool_cross_encoder_finetuned_v3 (model.safetensors)",
+    "note": "Identical llama_cpp build_sha and model_hash as the committed paper Run B — comparison is like-for-like."
+  },
+  "experiments": {
+    "gateway_route_latency": {
+      "harness": "test/bench_gateway_e2e.py",
+      "command": ".venv/bin/python test/bench_gateway_e2e.py --model <qwen> --embed-model <nomic> --query-limit 100 --force",
+      "repeats": 5,
+      "n_per_run": 100,
+      "n_pooled": 500,
+      "artifacts": ["raw/gateway_run1.json","raw/gateway_run2.json","raw/gateway_run3.json","raw/gateway_run4.json","raw/gateway_run5.json"],
+      "metrics": {
+        "ttft_route_splice_ms_p50": {"value": 160.2, "across_run_min": 159.4, "across_run_max": 161.2, "across_run_std": 0.6, "pooled_p50": 160.2, "pooled_p90": 190.7, "pooled_p99": 265.8},
+        "tool_accuracy": {"value": 0.89, "stable_across_all_5_runs": true}
+      },
+      "measurement_caveat": "This metric times route_with_retrieval ONLY (retrieval + CE gate + ATB splice). It explicitly sets decode_us=0 and does NOT include first-token generation. It is routing+splice latency, NOT time-to-first-token.",
+      "confidence": "HIGH",
+      "verdict": "CANONICAL. Replaces both committed headlines (171 ms Run A, 237 ms Run B); neither reproduces."
+    },
+    "l0_radix_microbench": {
+      "harness": "build/bench_phase28_radix_prefix",
+      "command": "build/bench_phase28_radix_prefix --model <qwen> --seed <0..9> --output raw/l0_seed_<s>.json",
+      "n_seeds": 10,
+      "n_pooled_requests": 1000,
+      "artifacts": ["raw/l0_seed_0.json","...","raw/l0_seed_9.json"],
+      "metrics": {
+        "hit_rate_pct": {"mean": 69.5, "min": 58, "max": 80},
+        "copy_p50_us": {"median": 3.06, "mean": 3.00, "min": 2.67, "max": 3.125},
+        "copy_p99_us": {"median": 7.63, "max": 27.71}
+      },
+      "confidence": "HIGH",
+      "verdict": "CANONICAL. Reproduces the paper's committed l0_radix_metrics.csv (69.5%, 3.04 us). Supersedes README's n=1 66%."
+    },
+    "p20_margin_calibration": {
+      "harness": "scripts/calibrate_margin_threshold.py",
+      "command": ".venv/bin/python scripts/calibrate_margin_threshold.py --embed-model <nomic>",
+      "artifacts": ["nexus_calibration_regen.py","raw/margin_calibration_p20.json"],
+      "metrics": {
+        "CALIBRATED_MARGIN_THRESHOLD": 0.013646852970123292,
+        "p20_all_fire_rate": 0.20300751879699247,
+        "ambiguous_clamp": 0.15
+      },
+      "confidence": "HIGH",
+      "verdict": "CANONICAL. Bit-exact reproduction of committed src/nexus_calibration.py."
+    },
+    "retrieval_recall": {
+      "harness": "scripts/analyze_recall_misses.py",
+      "command": ".venv/bin/python scripts/analyze_recall_misses.py --embed-model <nomic> --cross-encoder results/tool_cross_encoder_finetuned_v3",
+      "n_queries": 100,
+      "artifacts": ["raw/recall_miss_analysis.json"],
+      "metrics": {
+        "recall_at_1_dense": 0.87,
+        "recall_at_5_dense": 0.99,
+        "ce_recall_at_1": 0.88,
+        "ce_rerank_fraction": 0.20,
+        "margin_threshold": 0.013646852970123292,
+        "meets_target_0.90": false
+      },
+      "confidence": "HIGH",
+      "verdict": "CANONICAL. Dense R@1 0.87 reproduces exactly. CE R@1 is 0.88 (NOT the 0.90 claimed in README/RELEASE) and does not meet the 0.90 target."
+    },
+    "e2e_baselines_and_true_ttft": {
+      "harness": "test/bench_e2e.py",
+      "command": ".venv/bin/python test/bench_e2e.py --model <qwen> --embed-model <nomic> --query-limit 30 --force  (run serially, no concurrent benches)",
+      "n_per_arm": 30,
+      "artifacts": ["raw/e2e_clean_n30.json"],
+      "status": "COMPLETE (clean serial run)",
+      "metrics_ttft_p50_ms_true_ttft_incl_first_token": {
+        "B1_bloat": 9754.0,
+        "B3_baseline_BRP": 1214.0,
+        "N1_splice_no_gate": 498.0,
+        "N1x_nexus_splice_CE_gate": 518.0,
+        "B3pc_hit": 334.0
+      },
+      "accuracy": {"N1x": 0.87, "N1": 0.93, "B3": 0.93, "B1": 0.97},
+      "honest_speedups_like_for_like": {
+        "N1x_vs_B3": "2.34x",
+        "N1_vs_B3": "2.44x",
+        "N1x_vs_B1_strawman": "18.8x"
+      },
+      "misleading_do_not_publish": {"route_only_160ms_vs_B3_full_ttft": "7.6x"},
+      "superseded_contaminated_run": {
+        "artifact": "raw/e2e_n25.json",
+        "reason": "ran concurrently with another e2e (resource contention inflated absolutes: B3=2011ms vs clean 1214ms). Retained for provenance; NOT canonical.",
+        "process_note": "An earlier raw/e2e_n30.json (valid, 195KB, also concurrent) was erroneously deleted during cleanup; this clean serial run replaces it."
+      },
+      "confidence": "MEDIUM (n=30, clean serial). Clean B3=1214ms is consistent with prior committed runs (1330/1498ms), confirming the n=25 inflation was contention.",
+      "verdict": "CANONICAL. KEY FINDING: like-for-like Nexus(N1x)-vs-B3 true-TTFT speedup is 2.34x (518ms vs 1214ms), far below the headline 6.3x (which divided route-only 160ms by full-TTFT B3 = a misleading 7.6x). N1x acc 0.87 vs B3 0.93 = ~6-point trade-off at n=30 (gateway n=500 accuracy is 0.89)."
+    }
+  },
+  "rejected_for_canonical": {
+    "results/bench_gateway_e2e_v2.json": "Run A 171ms — not reproducible (now 160ms); docs miscite it as 237ms",
+    "docs/paper/data/_raw/gateway_full.json": "Run B 237ms — not reproducible (now 160ms)",
+    "results/bench_phase28_radix_prefix_v2.json": "n=1 66% — superseded by 10-seed 69.5%",
+    "docs/paper/data/physics_boundary_rope.csv": "pre-freeze validation records; NOT regenerated this pass; aggregate_physics_boundary.py not run",
+    "docs/paper/data/scalability_curve.csv": "SLB scalability not regenerated this pass"
+  }
+}

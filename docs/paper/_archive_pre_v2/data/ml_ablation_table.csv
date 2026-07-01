@@ -1,0 +1,4 @@
+config,ce_invocation_rate,ttft_p50_ms,ttft_p90_ms,ttft_p99_ms,tool_hit_accuracy,n_queries
+Nexus_Dense_Only,0.0,248.709,394.346,625.771,0.87,100
+Nexus_v0_Uncalibrated,0.15,292.018,351.896,382.369,0.85,100
+Nexus_v1_Production,0.2,307.932,423.894,523.388,0.89,100

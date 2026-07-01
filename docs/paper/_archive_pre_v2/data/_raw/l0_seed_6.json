@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "benchmark": "phase28_radix_prefix",
+  "git_sha": "3ea7441ef7f7834475e063df56ceec457f6070ba",
+  "llama_cpp_sha": "cb2463bb9f093d7bcaf3194988a8251234fabb69",
+  "model_hash": "/Volumes/AI_SSD/models/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf",
+  "hardware": "Darwin 25.5.0 arm64",
+  "timestamp": "2026-06-14T13:38:35Z",
+  "config": {
+    "requests": "100",
+    "seed": "6"
+  },
+  "metrics": {
+    "hit_rate": {
+      "unit": "ratio",
+      "raw_samples": [0.72],
+      "summary": {"mean":0.72,"std":0,"p50":0.72,"p90":0.72,"p99":0.72,"n":1}
+    },
+    "copy_p50_us": {
+      "unit": "us",
+      "raw_samples": [3],
+      "summary": {"mean":3,"std":0,"p50":3,"p90":3,"p99":3,"n":1}
+    },
+    "copy_p99_us": {
+      "unit": "us",
+      "raw_samples": [11.209],
+      "summary": {"mean":11.209,"std":0,"p50":11.209,"p90":11.209,"p99":11.209,"n":1}
+    }
+  }
+}

@@ -265,20 +265,48 @@ def load_n_tools(n: int):
 
 def compile_atb_files(tools, model_path):
     os.makedirs("test/schemas/jit_bloat", exist_ok=True)
-    
+
+    # Only the 10 routing TARGET tools (id 1..10) can ever be resolved by a query, so only
+    # they are ever spliced (the orchestrator lazily loads a block via get_or_load ONLY for
+    # the resolved tool_id -- nexus_orchestrator.cpp:140,445). Distractor tools (id>10) exist
+    # purely to dilute retrieval; their .atb is never read. Compiling a ~100 MB block per
+    # distractor is therefore pure waste, so distractors reuse a placeholder path. This does
+    # NOT change the measured routing accuracy: distractors still participate in SLB retrieval
+    # via their embeddings, which is exactly what makes routing harder as N grows.
+    placeholder = None
+
     # 1. Identify which tools need compilation
     to_compile = []
     for tool in tools:
         name = tool["name"]
         json_path = f"test/schemas/jit_bloat/{name}.json"
         atb_path = f"test/schemas/jit_bloat/{name}.atb"
-        
+
+        if int(tool.get("id", 999)) > 10:
+            # distractor: never spliced -> assign a placeholder path, do not compile
+            tool["_distractor"] = True
+            continue
+
         if os.path.exists(atb_path):
             tool["atb_path"] = atb_path
         else:
             to_compile.append((tool, json_path, atb_path))
-            
+
+    # assign every distractor a real, existing ATB path (never loaded) once targets are known
+    def _finalize_distractors():
+        ph = placeholder
+        if ph is None:
+            for t in tools:
+                if not t.get("_distractor") and t.get("atb_path") and os.path.exists(t["atb_path"]):
+                    ph = t["atb_path"]; break
+        if ph is None:
+            ph = "results/phaseA_tool_match_work/tool_0.isolated.atb"
+        for t in tools:
+            if t.get("_distractor"):
+                t["atb_path"] = ph
+
     if not to_compile:
+        _finalize_distractors()
         return
         
     # 2. Write temp JSON files and prepare batch list
@@ -304,7 +332,9 @@ def compile_atb_files(tools, model_path):
     # 4. Update tools and clean up batch list
     for tool, json_path, atb_path in to_compile:
         tool["atb_path"] = atb_path
-        
+
+    _finalize_distractors()
+
     if os.path.exists(batch_list_path):
         os.remove(batch_list_path)
 
@@ -675,7 +705,9 @@ Selected Tool Name:"""
         print(f"{size:<10} | {acc_a_str:<14} | {acc_b_str:<14} | {recall_str:<18} | {lat_save:<14} | {tok_save:<10}")
     print("="*80)
 
-    # Save to file
+    # Save to file. NOTE: write_artifact() normalizes anything passed via metrics= into a
+    # {raw_samples, summary} schema and zeroes flat dicts, so the real per-size numbers are
+    # preserved verbatim under extra["routing_summary"] instead (this is what the paper reads).
     write_artifact(
         args.output,
         "bench_routing_accuracy",
@@ -686,9 +718,11 @@ Selected Tool Name:"""
             "seed": args.seed,
             "runs": runs,
             "tool_sizes": sizes,
+            "n_queries": len(queries_dataset),
         },
-        metrics=overall_summary,
+        metrics={},
         records=[],
+        extra={"routing_summary": {str(k): v for k, v in overall_summary.items()}},
     )
     print(f"Wrote JSON artifact: {args.output}")
     
