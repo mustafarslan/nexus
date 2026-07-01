@@ -227,7 +227,7 @@ threshold (\code{max\_splice\_pos\_}), $R_{\mathrm{base}}=5\%$ the baseline reco
 R(n_{\mathrm{past}})=
 \begin{cases}
 R_{\mathrm{base}}, & n_{\mathrm{past}}\le M,\\[2pt]
-R_{\mathrm{base}}+\dfrac{n_{\mathrm{past}}-M}{M(K-1)}\bigl(100-R_{\mathrm{base}}\bigr), & n_{\mathrm{past}}>M,
+R_{\mathrm{base}}+\frac{n_{\mathrm{past}}-M}{M(K-1)}\bigl(100-R_{\mathrm{base}}\bigr), & n_{\mathrm{past}}>M,
 \end{cases}
 \label{eq:adaptive}
 \end{equation}
@@ -670,7 +670,7 @@ v2.0 bundle.
 Quantity & Value \\
 \midrule
 Routing accuracy, $N{=}250$ ($n{=}100$)      & 89\,\% {\scriptsize[81.4,\,93.7]} \\
-SLB top-1 / top-3 recall, $N{=}250$          & 74 / 95\,\% {\scriptsize\,[64.6,81.6]/[88.8,97.8]} \\
+SLB top-1 / top-3 recall, $N{=}250$          & 74 / 95\,\% \\
 SLB search latency, in-situ incl.\ FFI ($N{=}250$) & \SI{17.6}{\micro\second} \\
 SLB search latency, pure C++ SIMD scan       & \SI{8.25}{\micro\second} \\
 L0 radix copy latency (P50, $10$ seeds)      & \SI{3.04}{\micro\second} \\

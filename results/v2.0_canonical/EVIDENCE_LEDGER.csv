@@ -1,0 +1,31 @@
+claim,paper_loc,code_symbol,artifact,value,n,evidence_class
+Anchored splice output-exact,III.A,nexus_kv_splicer.cpp delta_pos,deep_splice_ttft.json (KL col),Logit-KL~0 top1=1.0,15/cell,MEASURED
+Off-anchor P1024 partial-recompute not viable,III.A,nexus_orchestrator.cpp recompute,rope_boundary_gate.json,KL up to 5.72; viable=false,12 cfgs,NEGATIVE_RESULT
+D_KL vs placement offset (bare splice),III.A/Fig dkl,bench_dkl_sweep.py inject_tool_page,dkl_sweep.json,KL ~1e-2 nats top1=1.0 across 0-2048; LegoLink 5.72@1024,10/offset,MEASURED
+Depth-adaptive recompute curve R(n_past),II.C/VI.A,nexus_orchestrator.hpp set_deep_splice; eff_pct(),deep_splice_ttft.json,5%->100% by depth,15/cell,MEASURED
+Never-regress (top1 held KL~0 all depths),VI.A,recompute_tail; eff_pct,deep_splice_ttft.json,top1 OK all cells,15/cell,MEASURED
+Deep-splice speedup K=4,VI.A/Table II,bench_v2_capstone.py,deep_splice_ttft.json,1.63/1.24/0.98/1.00x,15/cell,MEASURED
+Deep-splice speedup K=16,VI.A/Table II,bench_v2_capstone.py,deep_splice_ttft.json,1.73/1.42/1.17/1.07x,15/cell,MEASURED
+Causal isolation blockmask,III.B/Table (text),nexus orchestrator blockmask arm,causal_isolation.json,TensorKL=0.0 e2e-acc=0.0,20,NEGATIVE_RESULT
+Splice-seam arg corruption,III.C,sidecar vs main-context KV,design finding (sidecar/accuracy.json corroborates),first-field mis-fill,qual,DESIGN_FINDING
+Reference-free gate fails,III.D/Table I,test/profile_head_drift.py,gating_nogo.json,mean Spearman 0.193,6 conds,NEGATIVE_RESULT
+K-variance proxy uninformative (drift varies; proxy does not track it),III.D/Table I,profile_head_drift.py,gating_nogo.json,max drift 175-207 mean 91-105 rho=0.193,6 conds,NEGATIVE_RESULT
+SLB INT8 SIMD router,IV.A/V,nexus_slb.cpp dot_product_int8,routing_accuracy_n250.json,branchless NEON/AVX,-,IMPLEMENTED
+Margin gate tau (P20),IV.A/Table II,nexus_calibration.py,calibration.json,tau=0.013646852970123292,133q,MEASURED
+Gate fire rate,Table II,nexus_orchestrator margin,calibration.json,20.3% (p20),133q,MEASURED
+Routing accuracy N=250,VI.B/Table III,orchestrator route_and_splice,routing_accuracy_n250.json,89% (flat 92/90/89/89 across N),100,MEASURED
+SLB top-1/top-3 recall N=250,VI.B/Table III,nexus_slb.cpp search,routing_accuracy_n250.json,74%/95%,100,MEASURED
+Oracle overflows at N>=50,VI.B/Fig,concat-all baseline,routing_accuracy_n250.json,context overflow,100,MEASURED
+SLB search latency N=250 in-situ,VI.B/Table III,nexus_slb.cpp search,routing_accuracy_n250.json,17.6us median (real vectors),100,MEASURED
+Sidecar routing accuracy,VI.C/Table III,nexus_agent.py route_via_sidecar,sidecar/accuracy.json,86.7%,30,MEASURED
+Specified-arg accuracy (routed),VI.C/Table III,generate_via_hybrid,sidecar/accuracy.json,100% (Wilson >=91.2),40 args,MEASURED
+E2E argument accuracy,VI.C,generate_via_hybrid,sidecar/accuracy.json,80% (40/50; Wilson [67.0 88.8]),50 args,MEASURED
+JSON validity rate,VI.C/Table III,FSM/GBNF grammar,sidecar/accuracy.json,100% (0 leaks),30,MEASURED
+IR length median,IV.B/VI.C/Table III,semantic compressed IR,sidecar/accuracy.json,19 tokens p50 (32 p99),30,MEASURED
+Sidecar hybrid TTFT vs oracle,VI.C,generate_via_hybrid,sidecar/accuracy.json,443.8 vs 737.3 ms = 1.66x,30,MEASURED
+Transposed-V UMA splice,V.B,nexus_kv_splicer.cpp splice_v_layer,vtrans (results/v2_phase3_vtrans),implemented+tested (gemma-2-9b),-,IMPLEMENTED
+Discrete-GPU v_trans declines,V.B,nexus_kv_splicer.cpp:493 throw,code,throws by design,-,IMPLEMENTED
+Cache-line alignment,V.C,nexus_bitmap_allocator.hpp alignas(128),code static_assert,alignas(128) + static_assert,-,IMPLEMENTED
+4-thread determinism,V.C,coarse re-entrant lock,code (19 regression tests),bit-stable,-,IMPLEMENTED_NO_SPEEDUP_CLAIM
+L0 radix copy latency,V.D/Table III,nexus_seq_warm_cache seq_cp,l0_radix.json,3.04us P50 median,10 seeds,MEASURED
+L0 radix warm-hit rate,V.D/Table III,seq_warm_cache LCP,l0_radix.json,69.5% (0.58-0.80),10 seeds,MEASURED
