@@ -37,36 +37,27 @@ mustafarslan35@gmail.com}}
 \maketitle
 
 \begin{abstract}
-Agentic large language models (LLMs) built on the Model Context Protocol (MCP)
-re-encode verbose tool schemas on every turn, so prefill---quadratic in sequence
-length---dominates time-to-first-token (TTFT) as the tool registry grows. A natural
-remedy is to compile each schema once into a key/value (KV) cache block and splice it
-into the live context at inference time, paying the prefill cost only once. We show that
-this is fundamentally bounded by rotary position embedding (RoPE) phase drift: an anchored
-splice at the compile position is output-exact ($D_{\mathrm{KL}}(\mathbf{p}_0 \parallel \mathbf{p}_{\mathrm{splice}}) \approx 0$ on the next-token
-distribution, $\text{top-1 agreement} = 1.0$), but the error grows with placement offset: a
-historical gate study evaluating a scattered partial-recompute configuration (LegoLink) on a block
-placed at depth $1024$ found that partial recompute leaves the Kullback-Leibler divergence as high
-as $D_{\mathrm{KL}} \approx 5.7$~nats. Because this scattered recompute is retired in the active
-prototype, Nexus enforces a deterministic fallback to a $100\%$ suffix redecode (prefill parity)
-beyond a position threshold of $P=256$, ensuring zero output degradation. Nexus responds not by forcing a static boundary
-but by making the repair \emph{depth-adaptive}: past a $256$-token splice threshold it
-re-decodes a suffix fraction that scales with depth to $100\%$, converging to prefill
-parity and guaranteeing accuracy never regresses below a full text prefill. On this
-workload the deep splice yields a $1.1\text{--}1.7\times$ TTFT speedup at moderate depth,
-narrowing to parity at deep context. We decouple routing from splicing entirely: an
-INT8 semantic lookaside buffer plus a calibrated cross-encoder gate selects tools by
-retrieval, and arguments are generated over a compressed textual signature (median
-$19$ tokens) rather than over spliced KV. Routing accuracy stays near $89\%$ as the
-registry scales to $250$ tools, where a concatenate-all-schemas baseline overflows the
-context window entirely. Two negative results bound the design space: the off-anchor RoPE
-fidelity boundary above, and the failure of a reference-free drift gate to predict drift
-(Spearman $\rho=0.193$). We also contribute two systems mechanisms for Apple-silicon
-unified memory---transposed-V splicing for soft-capped attention and cache-line hardening
-of the block allocator. Nexus is presented as a systems prototype characterized by its measured performance envelope under physical constraints. All quantitative
-measurements are from one model tuple (\code{Qwen2.5-14B-Instruct Q4\_K\_M}) on unified memory,
-and its durable contribution is the measured envelope and the negative results that bound
-what any KV-splicing agent serving system can safely assume.
+Agentic large language models (LLMs) on the Model Context Protocol (MCP) re-encode verbose tool
+schemas every turn, so prefill---quadratic in sequence length---dominates time-to-first-token
+(TTFT) as the tool registry grows. Nexus's primary lever is to \emph{decouple routing from the
+schema-prefill cost}: an INT8 semantic lookaside buffer (SLB) with a calibrated cross-encoder
+margin gate selects tools by retrieval, and arguments are generated over a compressed textual
+signature (median $19$ tokens) rather than over spliced key/value (KV) cache. This path is
+depth-independent: routing accuracy stays near $89\%$ as the registry scales to $250$ tools---where
+a concatenate-all-schemas baseline overflows the context window entirely---and it reaches a
+first-argument token $1.66\times$ sooner than a full-schema re-prefill at an ${\approx}80\%$
+main-context token saving. As a secondary, bounded lever we transplant a compiled schema KV block
+directly into the live context. This is fundamentally limited by rotary position embedding (RoPE)
+phase drift: an anchored splice is output-exact, but off-anchor placement corrupts attention, so
+beyond a threshold $P=256$ Nexus repairs the seam with a depth-adaptive suffix redecode that
+escalates to a full re-prefill. The resulting never-regress property is a guarantee on output
+\emph{fidelity} (top-1 agreement, $D_{\mathrm{KL}}\approx 0$)---not on latency, which can dip to
+$0.98\times$ before converging to parity---alongside a $1.1$--$1.7\times$ TTFT speedup at moderate
+depth that narrows to parity at deep context. Two negative results bound the design: the off-anchor
+RoPE fidelity boundary, and the failure of a reference-free drift gate to predict drift (Spearman
+$\rho=0.193$). All measurements are from one model tuple (\code{Qwen2.5-14B-Instruct Q4\_K\_M}) on
+Apple-silicon unified memory; the \emph{qualitative} boundaries generalize, while the
+\emph{quantitative} envelope is tuple-specific.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -100,14 +91,16 @@ number to a committed artifact under \code{results/v2.0\_canonical/}. We make fo
 contributions, tagged by evidence class:
 
 \begin{enumerate}
-  \item \textbf{Depth-adaptive recompute with a never-regress guarantee}
-  (\emph{measured}). Past a $256$-token splice threshold, Nexus re-decodes a suffix fraction
-  $R(n_{\mathrm{past}})$ that scales with depth to $100\%$, bounding accuracy loss to zero and
-  converging gracefully to prefill parity (\S\ref{sec:limits}, \S\ref{sec:eval}).
-  \item \textbf{Retrieval-decoupled routing} (\emph{measured}). Tool selection runs over an
-  INT8 semantic lookaside buffer (SLB) with a calibrated cross-encoder gate, and arguments
-  are generated over a compressed textual signature, avoiding the splice seam
-  (\S\ref{sec:arch}).
+  \item \textbf{Retrieval-decoupled routing} (\emph{measured}), the more durable and transferable
+  result. Tool selection runs over an INT8 semantic lookaside buffer (SLB) with a calibrated
+  cross-encoder gate, and arguments are generated over a compressed textual signature, avoiding the
+  splice seam. It is depth-independent, scales to $250$ tools where the concatenate-all baseline
+  cannot run, and delivers a $1.66\times$ first-argument latency win at ${\approx}80\%$ token saving
+  (\S\ref{sec:arch}, \S\ref{sec:eval}).
+  \item \textbf{Depth-adaptive recompute with a never-regress guarantee} (\emph{measured}), a
+  bounded, characterized secondary lever. Past a $256$-token splice threshold, Nexus re-decodes a
+  suffix fraction $R(n_{\mathrm{past}})$ that scales with depth to $100\%$, holding output fidelity
+  exact and converging gracefully to prefill parity (\S\ref{sec:limits}, \S\ref{sec:eval}).
   \item \textbf{Systems mechanisms for UMA} (\emph{implemented}): transposed-V splicing for
   soft-capped attention models and cache-line hardening of the block allocator
   (\S\ref{sec:systems}).
@@ -116,6 +109,18 @@ contributions, tagged by evidence class:
 \end{enumerate}
 
 We are explicit about scope. All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. The transposed-V splice mechanism is additionally implemented and fidelity-tested on a second, soft-capped model (\code{Gemma-2-9B}). However, the physical splicing mechanism is strictly limited to local execution of flash-attention-compatible, non-soft-capped GGUF architectures. Splicing cannot execute under local \code{Gemma4} execution (due to soft-capping forcing a transposed layout that the splicer rejects, and loading errors under the pinned \code{llama.cpp} version) or cloud execution (due to the physical nature of cache transplantation requiring direct memory copies into local physical cache addresses). Soft-capped and cloud models must fall back entirely to text-prefill (Path B, yielding a $1.0\times$ speedup). Sample sizes are small ($n\!\le\!30$ for end-to-end arms), and the deep splice is validated at the fidelity-and-latency level, not as a multi-turn production path. We view the negative results and the measured envelope as the durable contribution.
+
+Three research questions organize the paper. \textbf{RQ1}: how far can a relocated schema block be
+trusted before its next-token distribution departs from a full prefill (\S\ref{sec:limits})?
+\textbf{RQ2}: what does repairing that drift cost in TTFT (\S\ref{sec:eval})? \textbf{RQ3}: can
+routing and argument generation avoid the splice path entirely (\S\ref{sec:arch},
+\S\ref{sec:eval})?
+
+\emph{Artifact availability.} Every reported number traces to a committed artifact under
+\code{results/v2.0\_canonical/} at git \code{1ce4aa4} (\code{llama.cpp cb2463bb}), for the model
+tuple \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. The artifact bundle
+is available from the author on request pending release; a public archive with a DOI will be added
+on publication.
 
 %% ============================================================
 \section{Related Work}
@@ -161,18 +166,18 @@ relocates per-tool blocks and decouples routing from the splice path. Non-Nexus 
 reported on different hardware and workloads ($\dagger$: contextual, \emph{not} a controlled
 head-to-head; see \code{results/comparison\_sources.md}).}
 \label{tab:comparison}
-\footnotesize
-\begin{tabular}{@{}llllll@{}}
+\scriptsize
+\begin{tabular}{@{}l l l p{4.5cm} p{3.3cm} c@{}}
 \toprule
-System & KV strategy & Routing & Reported metric & Workload / HW & H2H? \\
+System & KV strategy & Routing & Reported metric (native HW/workload) & Workload / HW & H2H? \\
 \midrule
-RAG-MCP~\cite{ragmcp2025}                  & in-place (prompt-level)      & retrieve-$K$ + prefill & $43.1\%$ vs $13.6\%$ tool-sel.; ${>}50\%$ tokens$^\dagger$ & MCP stress test, LLM eval & no \\
+RAG-MCP~\cite{ragmcp2025}                  & in-place (prompt-level)      & retrieve-$K$ + prefill & $43.1\%$ vs $13.6\%$ tool selection; ${>}50\%$ prompt tokens$^\dagger$ & MCP stress test, LLM eval & no \\
 vLLM / PagedAttn~\cite{kwon2023vllm}       & in-place (paged)             & ---                    & $2\text{--}4\times$ throughput$^\dagger$                   & ShareGPT, A100/A10G       & no \\
 SGLang / RadixAttn~\cite{zheng2024sglang}  & in-place (prefix reuse)      & ---                    & up to $6.4\times$ throughput$^\dagger$                     & LLM programs, A10G/A100   & no \\
-vAttention~\cite{vattention2025}           & in-place (virtual contig.)   & ---                    & up to $1.23\times$ vs paged$^\dagger$                      & GPU serving               & no \\
-RedKnot~\cite{redknot2026}                 & in-place (head-aware)        & ---                    & resource efficiency (qual.)$^\dagger$                      & GPU serving               & no \\
+vAttention~\cite{vattention2025}           & in-place (virtual contig.)   & ---                    & up to $1.23\times$ vs paged kernels$^\dagger$              & GPU serving               & no \\
+RedKnot~\cite{redknot2026}                 & in-place (head-aware)        & ---                    & resource-efficiency gains (qualitative)$^\dagger$          & GPU serving               & no \\
 \midrule
-\textbf{Nexus} (this work)                 & \textbf{relocate} (per-tool) & SLB + margin gate      & routing $89\%$@250; first-arg $1.66\times$; splice $1.1\text{--}1.7\times$ & GitHub-MCP, M4 Max UMA, Qwen2.5-14B & --- \\
+\textbf{Nexus} (this work)                 & \textbf{relocate} (per-tool) & SLB + margin gate      & routing $89\%$@250 tools; first-arg $1.66\times$; deep-splice $1.1\text{--}1.7\times$ & GitHub-MCP, M4 Max UMA, Qwen2.5-14B & --- \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -256,18 +261,19 @@ so the repair fraction must escalate with depth until it is indistinguishable fr
 A natural optimization for the Path-A ($\le 256$) to Path-B ($>256$) transition is a cheap,
 reference-free runtime proxy---per-head preceding-context K-variance---that predicts when a deep
 splice will drift catastrophically. Profiling this proxy against the true per-head drift on the
-14B model (\code{gating\_nogo.json}) rules the approach out on two grounds. First, the proxy does
-not predict drift: mean Spearman $\rho=0.193$, well below the $0.40$ target. Second, mean per-head
-drift is nearly constant ($91$--$105$) across all depths and both on- and off-topic contexts
-(Table~\ref{tab:gating}), so there is no per-request variance for a scalar-threshold gate to act
-on; it would either always fire or never fire. An effective online gate would require a true
+14B model (\code{gating\_nogo.json}) rules the approach out. The proxy does
+not predict drift: mean Spearman $\rho=0.193$, well below the $0.40$ target. Per-head drift is not
+itself absent---max drift ranges $175$--$207$ and mean drift $91$--$105$ across depths and both on-
+and off-topic contexts (Table~\ref{tab:gating})---but the K-variance proxy fails to rank-correlate
+with that variation, so a scalar-threshold gate driven by it cannot separate high- from low-drift
+heads and would fire indiscriminately. An effective online gate would require a true
 reference (the full prefill cost we seek to avoid) or a custom attention kernel. This justifies
 keeping the deterministic depth-adaptive curve of \eqref{eq:adaptive} as the repair mechanism.
 
 \begin{table}[t]
 \centering
-\caption{Reference-free drift gate: the K-variance proxy does not predict drift, and drift is
-nearly constant across depth (\code{gating\_nogo.json}).}
+\caption{Reference-free drift gate: per-head drift varies (max $175$--$207$, mean $91$--$105$),
+but the K-variance proxy fails to rank-correlate with it ($\rho=0.193$) (\code{gating\_nogo.json}).}
 \label{tab:gating}
 \small
 \begin{tabular}{rlrrr}
@@ -365,7 +371,8 @@ temporary \emph{sidecar} sequence beginning at position $0$, so the anchored spl
 the output-exact regime of \S\ref{sec:limits}. To preserve multi-turn coreference (e.g., ``open a
 pull request \emph{there}''), the sidecar carries a pruned sliding window: recent turns are kept
 verbatim while bulky tool payloads are replaced by short semantic surrogates. Given the resolved
-tool, arguments are generated in the main context over a \emph{semantic compressed IR}: the JSON
+tool, arguments are generated in the main context over a \emph{semantic compressed intermediate
+representation} (IR): the JSON
 schema is reduced to a dense, type-hinted function signature with truncated inline descriptions,
 e.g.\ \code{create\_repository(name: string, private?: boolean)}. At a median of $19$ tokens the IR
 is far smaller than the full schema, so the main-context prefill avoids schema bloat while
@@ -464,6 +471,10 @@ Table~\ref{tab:perf} reports median TTFT of the deep splice against a full text-
 at increasing context depth, for the default curve ($K=4$) and a flatter tuned curve ($K=16$),
 with $15$ trials per cell (\code{deep\_splice\_ttft.json}). Two facts hold across every cell:
 top-1 next-token agreement is preserved and the next-token $D_{\mathrm{KL}}(\mathbf{p}_0 \parallel \mathbf{p}_{\mathrm{splice}})$ is $\approx 0$---the never-regress guarantee.
+We stress that never-regress is a guarantee on output \emph{fidelity} (top-1 agreement and
+$D_{\mathrm{KL}}\approx 0$), not on latency: because the repaired suffix adds redecode work, measured
+TTFT can dip slightly below parity (e.g.\ $0.98\times$ at $n_{\mathrm{past}}=1024$, $K=4$) before
+converging to $1.0\times$; the fidelity guarantee is never violated even where the latency ratio is.
 The speedup is not flat: at moderate depth the splice saves $1.1$--$1.7\times$, and as
 $R(n_{\mathrm{past}})$ escalates toward $100\%$ the repaired splice converges to prefill parity
 ($\approx 1.0\times$). Flat TTFT and never-regress are in genuine tension, and $K$ is the dial
@@ -527,8 +538,11 @@ tools (\code{routing\_accuracy\_n250.json}). End-to-end routing accuracy is near
 $92\%$, $90\%$, $89\%$, $89\%$ at $N=10,50,100,250$ (Fig.~\ref{fig:route}), with SLB top-1 recall
 $74\%$ and top-3 recall $95\%$ at $N=250$. The contrast with the concatenate-all-schemas oracle is
 the point: the oracle reaches $98\%$ at $N=10$ but \emph{overflows the context window at $N\ge50$}
-and cannot answer at all, whereas Nexus keeps the main-context prompt small (a ${\sim}100\%$ token
-reduction versus the oracle) and continues to route. Because SLB search depends only on the query
+and cannot answer at all, whereas Nexus keeps the main-context prompt small and continues to route.
+Because the oracle no longer fits the prompt at $N\ge50$, a token-reduction ratio against it is
+undefined there; Nexus instead holds the main-context routing payload to a median $19$-token IR
+(\S\ref{sec:arch}). Where a ratio is well defined---the sidecar's hybrid path against a
+full-schema re-prefill---the main-context saving is ${\approx}80\%$ (\S\ref{sec:eval}). Because SLB search depends only on the query
 embedding and the registry, tool count does not inflate TTFT: the in-situ INT8 scan over $250$ real
 tool vectors completes in \SI{17.6}{\micro\second} (median, including the Python FFI boundary;
 \code{routing\_accuracy\_n250.json}), while the pure C++ SIMD dot-product scan over $250$ unit-norm
@@ -639,8 +653,12 @@ off-anchor boundary and the reference-free gating failure as well-supported nega
 We design the serving substrate to decouple semantic routing from the attention-level phase drift boundary,
 executing partial recomputes only where mathematically required to restore output fidelity.
 On a single-host 14B prototype this delivers a $1.1$--$1.7\times$ TTFT reduction at moderate depth
-with high argument validity. We view the measured envelope and the negative results as the durable contribution:
-they bound what any KV-splicing agent serving system can safely assume.
+with high argument validity. We view the measured envelope and the negative results as the durable
+contribution, and we separate what generalizes from what does not: the \emph{qualitative} boundaries
+---off-anchor relocation drifts, scattered recompute cannot cheaply repair it, and reference-free
+gating fails to predict it---are properties of RoPE and hold model-agnostically, whereas the
+\emph{quantitative} envelope (the $P=256$ threshold, the recompute-curve constants, and the specific
+divergence magnitudes) is calibrated to one model tuple and must be re-measured elsewhere.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
