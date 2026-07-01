@@ -519,7 +519,7 @@ pre-reserved arena (\code{llama\_kv\_cache\_seq\_cp}) rather than allocating on 
 \section{Evaluation}
 \label{sec:eval}
 %% ============================================================
-All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. Sample sizes are stated per result; they are small, and we treat the numbers as an envelope rather than a population estimate. We emphasize that all quantitative evaluation is restricted to this local, flash-attention-compatible, non-soft-capped configuration. Physical splicing is architecturally incompatible with remote cloud APIs (which accept only text token streams) and local soft-capped layouts (e.g., \code{Gemma4}) that disable FlashAttention and require transposed V-cache storage; these execute with zero system acceleration, falling back to standard text prefills.
+All benchmarks were executed on an Apple M4 Max SoC (16-core CPU, 40-core GPU, 16-core Neural Engine) equipped with 64\,GB Unified Memory and a 1\,TB NVMe SSD, running macOS/Darwin 25.5.0 (arm64), at git \code{1ce4aa4} / \code{llama.cpp cb2463bb}. All measurements use \code{Qwen2.5-14B-Instruct Q4\_K\_M} with \code{nomic-embed-text-v1.5}. Artifacts are under \code{results/v2.0\_canonical/}. Sample sizes are stated per result; they are small, and we treat the numbers as an envelope rather than a population estimate. To make that framing concrete rather than a disclaimer, every headline proportion carries a Wilson $95\%$ interval and every TTFT median a bootstrap $95\%$ interval (the deep-splice cells use $n{=}15$ trials); speedup intervals propagate the prefill and splice median CIs. We emphasize that all quantitative evaluation is restricted to this local, flash-attention-compatible, non-soft-capped configuration. Physical splicing is architecturally incompatible with remote cloud APIs (which accept only text token streams) and local soft-capped layouts (e.g., \code{Gemma4}) that disable FlashAttention and require transposed V-cache storage; these execute with zero system acceleration, falling back to standard text prefills.
 
 \subsection{Depth-Adaptive Splice: TTFT and Never-Regress}
 Table~\ref{tab:perf} reports median TTFT of the deep splice against a full text-prefill baseline,
@@ -540,24 +540,27 @@ between them (Fig.~\ref{fig:ttft}).
 \caption{Deep-splice TTFT vs.\ depth ($n{=}15$ trials/cell). Never-regress holds everywhere
 (top-1 OK, $D_{\mathrm{KL}}(\mathbf{p}_0 \parallel \mathbf{p}_{\mathrm{splice}}) \approx 0$); speedup narrows to parity as recompute escalates.
 Eq.~\eqref{eq:adaptive} reproduces the $R$(\%) column exactly (verified), so the recompute
-schedule can be audited without the code. Source: \code{deep\_splice\_ttft.json}.}
+schedule can be audited without the code. Speedup intervals propagate the per-cell bootstrap
+$95\%$ CIs of the prefill and splice medians (independent timing loops). Source:
+\code{deep\_splice\_ttft.json}.}
 \label{tab:perf}
-\small
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
 \begin{tabular}{crrrcc}
 \toprule
-$n_{\mathrm{past}}$ & $R$ (\%) & prefill (ms) & splice (ms) & speedup & top-1/$D_{\mathrm{KL}}$ \\
+$n_{\mathrm{past}}$ & $R$ (\%) & prefill (ms) & splice (ms) & speedup [95\% CI] & top-1/$D_{\mathrm{KL}}$ \\
 \midrule
 \multicolumn{6}{l}{\textbf{Default curve} $K=4$} \\
-256  & 5.0   & 3278 & 2010 & $1.63\times$ & OK / $\approx 0$ \\
-512  & 36.7  & 4672 & 3761 & $1.24\times$ & OK / $\approx 0$ \\
-1024 & 100.0 & 7302 & 7425 & $0.98\times$ & OK / $0$ \\
-2048 & 100.0 & 13092 & 13142 & $1.00\times$ & OK / $0$ \\
+256  & 5.0   & 3278 & 2010 & $1.63$\,{\scriptsize[1.62,1.67]} & OK / $\approx 0$ \\
+512  & 36.7  & 4672 & 3761 & $1.24$\,{\scriptsize[1.23,1.25]} & OK / $\approx 0$ \\
+1024 & 100.0 & 7302 & 7425 & $0.98$\,{\scriptsize[0.97,1.00]} & OK / $0$ \\
+2048 & 100.0 & 13092 & 13142 & $1.00$\,{\scriptsize[0.99,1.00]} & OK / $0$ \\
 \midrule
 \multicolumn{6}{l}{\textbf{Tuned curve} $K=16$} \\
-256  & 5.0   & 3327 & 1924 & $1.73\times$ & OK / $\approx 0$ \\
-512  & 11.3  & 4747 & 3336 & $1.42\times$ & OK / $\approx 0$ \\
-1024 & 24.0  & 7625 & 6532 & $1.17\times$ & OK / $\approx 0$ \\
-2048 & 49.3  & 13468 & 12620 & $1.07\times$ & OK / $\approx 0$ \\
+256  & 5.0   & 3327 & 1924 & $1.73$\,{\scriptsize[1.72,1.75]} & OK / $\approx 0$ \\
+512  & 11.3  & 4747 & 3336 & $1.42$\,{\scriptsize[1.42,1.43]} & OK / $\approx 0$ \\
+1024 & 24.0  & 7625 & 6532 & $1.17$\,{\scriptsize[1.14,1.19]} & OK / $\approx 0$ \\
+2048 & 49.3  & 13468 & 12620 & $1.07$\,{\scriptsize[1.01,1.08]} & OK / $\approx 0$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -575,8 +578,12 @@ $n_{\mathrm{past}}$ & $R$ (\%) & prefill (ms) & splice (ms) & speedup & top-1/$D
   grid=both, grid style={gray!18}, tick label style={font=\scriptsize},
   label style={font=\scriptsize},
 ]
-\addplot[color=nxblue,mark=*,line width=1pt] coordinates {(256,1.63)(512,1.24)(1024,0.98)(2048,1.00)};
-\addplot[color=nxamber,mark=square*,line width=1pt] coordinates {(256,1.73)(512,1.42)(1024,1.17)(2048,1.07)};
+\addplot[color=nxblue,mark=*,line width=1pt,error bars/.cd,y dir=both,y explicit]
+  table[row sep=\\,x=x,y=y,y error plus=ep,y error minus=em]{
+  x y ep em \\ 256 1.63 0.04 0.01 \\ 512 1.24 0.01 0.01 \\ 1024 0.98 0.02 0.01 \\ 2048 1.00 0.005 0.01 \\};
+\addplot[color=nxamber,mark=square*,line width=1pt,error bars/.cd,y dir=both,y explicit]
+  table[row sep=\\,x=x,y=y,y error plus=ep,y error minus=em]{
+  x y ep em \\ 256 1.73 0.02 0.01 \\ 512 1.42 0.01 0.005 \\ 1024 1.17 0.02 0.03 \\ 2048 1.07 0.01 0.06 \\};
 \addplot[dashed,color=nxgray] coordinates {(256,1.0)(2048,1.0)};
 \legend{$K{=}4$ (default),$K{=}16$ (tuned),parity}
 \end{axis}
@@ -590,8 +597,10 @@ suffix; both converge to parity as $R(n_{\mathrm{past}})\!\to\!100\%$.}
 \subsection{Routing Accuracy and Registry Scale}
 Routing is evaluated over $100$ GitHub-MCP queries as the registry scales from $N=10$ to $N=250$
 tools (\code{routing\_accuracy\_n250.json}). End-to-end routing accuracy is nearly flat with scale:
-$92\%$, $90\%$, $89\%$, $89\%$ at $N=10,50,100,250$ (Fig.~\ref{fig:route}), with SLB top-1 recall
-$74\%$ and top-3 recall $95\%$ at $N=250$. The contrast with the concatenate-all-schemas oracle is
+$92\%$, $90\%$, $89\%$, $89\%$ at $N=10,50,100,250$ (Fig.~\ref{fig:route}); at $N=250$ the routing
+accuracy carries a Wilson $95\%$ CI of $[81.4, 93.7]$ ($n{=}100$), with SLB top-1 recall
+$74\%$ $[64.6, 81.6]$ and top-3 recall $95\%$ $[88.8, 97.8]$. The contrast with the
+concatenate-all-schemas oracle is
 the point: the oracle reaches $98\%$ at $N=10$ but \emph{overflows the context window at $N\ge50$}
 and cannot answer at all, whereas Nexus keeps the main-context prompt small and continues to route.
 Because the oracle no longer fits the prompt at $N\ge50$, a token-reduction ratio against it is
@@ -617,8 +626,12 @@ $N=250$ collapses. Table~\ref{tab:micro} summarizes routing and micro-costs.
   legend style={font=\scriptsize,at={(0.5,-0.28)},anchor=north,legend columns=2,draw=nxgray},
   grid=both, grid style={gray!18}, tick label style={font=\scriptsize}, label style={font=\scriptsize},
 ]
-\addplot[color=nxblue,mark=*,line width=1pt] coordinates {(10,92)(50,90)(100,89)(250,89)};
-\addplot[color=nxteal,mark=triangle*,line width=1pt] coordinates {(10,76)(50,74)(100,74)(250,74)};
+\addplot[color=nxblue,mark=*,line width=1pt,error bars/.cd,y dir=both,y explicit]
+  table[row sep=\\,x=x,y=y,y error plus=ep,y error minus=em]{
+  x y ep em \\ 10 92 3.9 7.0 \\ 50 90 4.5 7.4 \\ 100 89 4.7 7.6 \\ 250 89 4.7 7.6 \\};
+\addplot[color=nxteal,mark=triangle*,line width=1pt,error bars/.cd,y dir=both,y explicit]
+  table[row sep=\\,x=x,y=y,y error plus=ep,y error minus=em]{
+  x y ep em \\ 10 76 7.3 9.2 \\ 50 74 7.6 9.4 \\ 100 74 7.6 9.4 \\ 250 74 7.6 9.4 \\};
 \addplot[color=nxamber,mark=square*,densely dashed,line width=1pt] coordinates {(10,98)};
 \addplot[color=nxred,mark=x,only marks,mark size=3pt] coordinates {(50,0)(100,0)(250,0)};
 \legend{Nexus routing acc.,SLB R@1,oracle (fits),oracle: ctx overflow}
@@ -632,10 +645,11 @@ the context window at $N\ge50$ and cannot route at all.}
 
 \subsection{Argument Fidelity}
 Over the compressed textual IR (median $19$ tokens, p99 $32$), the sidecar routes correctly on
-$86.7\%$ of the $30$-case consistency set and, on the routed cases, fills $100\%$ of
-query-specified arguments correctly with a $100\%$ JSON validity rate and no placeholder leakage
+$86.7\%$ (Wilson $95\%$ CI $[70.3, 94.7]$) of the $30$-case consistency set and, on the routed
+cases, fills $100\%$ ($95\%$ CI ${\ge}91.2\%$ over $40$ specified arguments) of query-specified
+arguments correctly with a $100\%$ JSON validity rate and no placeholder leakage
 (\code{sidecar/accuracy.json}); end-to-end argument accuracy, which charges routing errors as
-failures, is $80\%$. The hybrid path reaches its first-argument token in $443.8$~ms versus
+failures, is $80\%$ ($40/50$ arguments, $[67.0, 88.8]$). The hybrid path reaches its first-argument token in $443.8$~ms versus
 $737.3$~ms for an oracle that re-prefills the full schema every turn---a $1.66\times$ reduction
 at an $\approx 80\%$ main-context token saving. The pruned sliding window of \S\ref{sec:arch}
 keeps recent-turn referents available for cross-turn arguments without re-admitting bulky schema
@@ -644,24 +658,27 @@ v2.0 bundle.
 
 \begin{table}[t]
 \centering
-\caption{Routing and micro-costs at $N{=}250$ tools. Sources: \code{routing\_accuracy\_n250.json},
-\code{slb\_latency.json}, \code{sidecar/accuracy.json}, \code{calibration.json}, \code{l0\_radix.json}.}
+\caption{Routing and micro-costs at $N{=}250$ tools. Proportions carry Wilson $95\%$ intervals
+(bracketed); ${\ge}x$ denotes the lower bound of a $100\%$ cell. Sources:
+\code{routing\_accuracy\_n250.json}, \code{slb\_latency.json}, \code{sidecar/accuracy.json},
+\code{calibration.json}, \code{l0\_radix.json}.}
 \label{tab:micro}
-\small
+\footnotesize
+\setlength{\tabcolsep}{3pt}
 \begin{tabular}{lr}
 \toprule
 Quantity & Value \\
 \midrule
-Routing accuracy, $N{=}250$ ($n{=}100$)      & 89\,\% \\
-SLB top-1 / top-3 recall, $N{=}250$          & 74 / 95\,\% \\
+Routing accuracy, $N{=}250$ ($n{=}100$)      & 89\,\% {\scriptsize[81.4,\,93.7]} \\
+SLB top-1 / top-3 recall, $N{=}250$          & 74 / 95\,\% {\scriptsize\,[64.6,81.6]/[88.8,97.8]} \\
 SLB search latency, in-situ incl.\ FFI ($N{=}250$) & \SI{17.6}{\micro\second} \\
 SLB search latency, pure C++ SIMD scan       & \SI{8.25}{\micro\second} \\
 L0 radix copy latency (P50, $10$ seeds)      & \SI{3.04}{\micro\second} \\
 L0 radix warm-hit rate ($10$ seeds)          & 69.5\,\% \\
-Sidecar routing accuracy ($n{=}30$)          & 86.7\,\% \\
-Specified-arg accuracy (routed cases)        & 100\,\% \\
-End-to-end argument accuracy                 & 80\,\% \\
-JSON validity rate                           & 100\,\% \\
+Sidecar routing accuracy ($n{=}30$ cases)    & 86.7\,\% {\scriptsize[70.3,\,94.7]} \\
+Specified-arg accuracy (routed, $n{=}40$ args) & 100\,\% {\scriptsize(${\ge}91.2$)} \\
+End-to-end argument accuracy ($n{=}50$ args)  & 80\,\% {\scriptsize[67.0,\,88.8]} \\
+JSON validity rate ($n{=}30$)                & 100\,\% {\scriptsize(${\ge}88.6$)} \\
 IR length, median / p99                      & 19 / 32 tok \\
 Cross-encoder gate $\tau$ (P20)              & 0.0136 \\
 Gate fire rate                               & 20.3\,\% \\

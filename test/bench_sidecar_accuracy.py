@@ -39,10 +39,7 @@ lib_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../build/exte
 os.environ["LLAMA_CPP_LIB_PATH"] = lib_dir
 os.environ["LLAMA_CPP_LIB"] = os.path.join(lib_dir, "libllama.dylib")
 
-import llama_cpp  # noqa: E402
-from bench_routing_accuracy import queries_dataset, load_first_10_tools  # noqa: E402
-from nexus_agent import NexusAgent  # noqa: E402
-from nexus_retrieval import DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MARGIN, embed_tool_document  # noqa: E402
+from bench_routing_accuracy import queries_dataset, load_n_tools, compile_atb_files  # noqa: E402
 
 MODEL = "/Volumes/AI_SSD/models/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf"
 ATB_DIR = Path("results/phaseA_tool_match_work")
@@ -93,26 +90,23 @@ def _norm(s):
     return str(s).lower().replace("-", "").replace("_", "").replace(" ", "").strip()
 
 
-def build_agent():
-    llm_emb = llama_cpp.Llama(model_path=DEFAULT_EMBED_MODEL, embedding=True, verbose=False)
-    llm = llama_cpp.Llama(model_path=MODEL, n_ctx=8192, n_batch=2048,
-                          n_gpu_layers=999, flash_attn=True, verbose=False)
+def build_agent_with_size(llm, llm_emb, size):
     agent = NexusAgent(llm, llm_emb, base_pos=256, max_splice_pos=256,
                        rerank_margin=DEFAULT_RERANK_MARGIN)
-    tools = load_first_10_tools()
+    # Using load_n_tools imported from bench_routing_accuracy
+    tools = load_n_tools(size)
+    compile_atb_files(tools, MODEL)
+    
     for i, tool in enumerate(tools):
         emb = embed_tool_document(llm_emb, tool)
-        digest = f"Tool Name: {tool['name']}. Description: {tool.get('description', '')}."
+        digest = f"Tool Name: {tool['name']}. Description: {tool.get('desc', '')}."
         agent.register_tool(i + 1, tool["name"], emb, digest,
-                            str(ATB_DIR / f"tool_{i}.isolated.atb"),
-                            schema=tool.get("inputSchema"))
-    return agent, {t["name"] for t in tools}
+                            tool["atb_path"],
+                            schema=tool.get("inputSchema") or tool.get("input_schema"))
+    return agent, {t["name"] for t in tools}, tools
 
 
 def deep_history():
-    """A realistic short prior conversation. (The old 180-key raw blob was a relic of
-    the splice-sidecar pruning stress; for the Hybrid it just bled into string args
-    and is not representative.)"""
     return [
         {"role": "user", "content": "Let's work through some GitHub tasks today."},
         {"role": "assistant", "content": "Ready to help with repository operations."},
@@ -122,7 +116,6 @@ def deep_history():
 
 
 def full_schema_text(agent, tool_id):
-    """The Oracle's grounding: the FULL JSON schema as text (vs the Hybrid's IR)."""
     import json
     rec = next((r for r in agent.tool_records
                 if agent.tool_name_to_id.get(r["name"]) == tool_id), None)
@@ -133,19 +126,6 @@ def full_schema_text(agent, tool_id):
 
 
 def try_repair_json(s: str) -> tuple[dict, bool]:
-    """Attempt to parse JSON; if truncated, try conservative repairs.
-    
-    Returns (parsed_dict, was_repaired). If completely unparseable, returns ({}, False).
-    
-    Repair strategy (ordered from most to least conservative):
-    1. json.loads(s) -- no repair needed
-    2. Append closing suffixes ('"}', '}', '"]}', ']}') -- handles mid-string truncation
-    3. Regex key-value extraction -- handles severely truncated outputs where the
-       opening fields are correct but the JSON is cut deep inside a later value
-    
-    The regex fallback extracts only string, boolean, and integer values. It does NOT
-    attempt to reconstruct arrays or nested objects, keeping false-positive risk low.
-    """
     s = (s or "").strip()
     if not s.startswith("{"):
         return {}, False
@@ -158,7 +138,7 @@ def try_repair_json(s: str) -> tuple[dict, bool]:
     except Exception:
         pass
     
-    # Strategy 2: append closing suffixes (handles mid-string/mid-object truncation)
+    # Strategy 2: append closing suffixes
     for suffix in ['"}', '}', '",}', '"]}', ']}']:
         try:
             d = json.loads(s + suffix)
@@ -167,16 +147,12 @@ def try_repair_json(s: str) -> tuple[dict, bool]:
         except Exception:
             pass
     
-    # Strategy 3: regex extraction for severely truncated outputs
-    # Only extract complete key-value pairs that appear before the truncation point
+    # Strategy 3: regex extraction
     result = {}
-    # String values: "key": "value" (non-greedy, stops at unescaped quote)
     for m in re.finditer(r'"([^"]+)"\s*:\s*"((?:[^"\\]|\\.)*)"', s):
         result[m.group(1)] = m.group(2)
-    # Boolean values: "key": true/false
     for m in re.finditer(r'"([^"]+)"\s*:\s*(true|false)(?=[,}\s])', s):
         result[m.group(1)] = m.group(2) == "true"
-    # Integer values: "key": 123
     for m in re.finditer(r'"([^"]+)"\s*:\s*(\d+)(?=[,}\s])', s):
         result[m.group(1)] = int(m.group(2))
     
@@ -184,13 +160,6 @@ def try_repair_json(s: str) -> tuple[dict, bool]:
 
 
 def compare_to_gold(hybrid: str, gold: dict) -> dict:
-    """v1.9: score generated args against gold with truncation recovery.
-
-    - parse_ok  : generated string yielded a usable dict (clean or repaired).
-    - repaired  : True if the dict required truncation recovery.
-    - leak      : any generated VALUE contains a <placeholder> marker.
-    - per gold field: string -> _norm()-equal; bool/int -> exact. Missing key -> wrong.
-    """
     a, repaired = try_repair_json(hybrid)
     parse_ok = bool(a)
 
@@ -233,9 +202,6 @@ def pct(xs, p):
 
 
 def coreference_fixture():
-    """V3: multi-turn anaphora. The referent (repo/file name) lives in PRIOR turns;
-    the answer is correct only if the pruned sliding window preserves Markov state.
-    Tools restricted to the registered GitHub-10."""
     return [
         {"name": "branch_in_searched_repo", "tool": "create_branch", "must_contain": "payment-gateway",
          "messages": [
@@ -275,104 +241,191 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="tiny run to validate the harness")
     ap.add_argument("--limit", type=int, default=100, help="routing+TTFT query count")
     ap.add_argument("--cons-n", type=int, default=40, help="oracle-consistency query count")
-    ap.add_argument("--max-tokens", type=int, default=256)  # v1.9: raised to 256 to prevent truncation
+    ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
+    ap.add_argument("--tool-sizes", default="10", help="Space-separated list of tool registry sizes, e.g. '10 20 26'")
+    ap.add_argument("--runs", type=int, default=1, help="Number of trials per tool size")
     args = ap.parse_args()
+    
     if args.smoke:
         args.limit, args.cons_n, args.max_tokens = 3, 3, 32
-
-    agent, tool_names = build_agent()
+        
+    sizes = [int(s) for s in args.tool_sizes.split()]
+    runs = args.runs
+    
+    import shutil
+    print(f"Pre-compiling all tools up to size {max(sizes)} on GPU...")
+    max_tools = load_n_tools(max(sizes))
+    compile_atb_files(max_tools, MODEL)
+    print("Pre-compilation finished successfully.")
+        
+    print(f"Loading models once for sidecar benchmark...")
+    global llama_cpp, NexusAgent, DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MARGIN, embed_tool_document
+    import llama_cpp
+    from nexus_agent import NexusAgent
+    from nexus_retrieval import DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MARGIN, embed_tool_document
+    llm_emb = llama_cpp.Llama(model_path=DEFAULT_EMBED_MODEL, embedding=True, verbose=False)
+    llm = llama_cpp.Llama(model_path=MODEL, n_ctx=8192, n_batch=2048,
+                          n_gpu_layers=999, flash_attn=True, verbose=False)
+                          
+    overall_results = {}
     hist = deep_history()
-    cases = [c for c in queries_dataset if c["tool"] in tool_names][: args.limit]
+    
+    for size in sizes:
+        print(f"\n======================================================================")
+        print(f"Evaluating Sidecar Generation Accuracy at N = {size}...")
+        print(f"======================================================================")
+        
+        runs_routing_acc = []
+        runs_arg_acc_routed = []
+        runs_arg_acc_e2e = []
+        runs_placeholder_leaks = []
+        runs_json_valid = []
+        runs_ttft_hybrid = []
+        runs_ttft_oracle = []
+        runs_token_savings = []
+        last_ir_toks = []
+        last_counts = {}
 
-    routing_hits, ir_toks, ttft_hybrid, ttft_oracle = 0, [], [], []
-    cons_records = []
+        for run_idx in range(runs):
+            print(f"  Run {run_idx + 1}/{runs}...")
+            agent, tool_names, tools = build_agent_with_size(llm, llm_emb, size)
+            cases = [c for c in queries_dataset if c["tool"] in tool_names][: args.limit]
+            
+            routing_hits, ir_toks, ttft_hybrid, ttft_oracle = 0, [], [], []
+            cons_records = []
+            
+            for idx, case in enumerate(cases):
+                q, gold = case["query"], case["tool"]
+                msgs = hist + [{"role": "user", "content": q}]
 
-    for idx, case in enumerate(cases):
-        q, gold = case["query"], case["tool"]
-        msgs = hist + [{"role": "user", "content": q}]
+                # HYBRID routing + TTFT (max_tokens=1)
+                t0 = time.perf_counter()
+                tool_name, _, meta = agent.generate_via_hybrid(msgs, max_tokens=1)
+                ttft_hybrid.append((time.perf_counter() - t0) * 1e3)
+                if meta.get("ir_tokens"):
+                    ir_toks.append(meta["ir_tokens"])
+                hit = bool(tool_name) and (gold in tool_name or tool_name in gold)
+                routing_hits += int(hit)
+                routed_ok = tool_name == gold
+                rid = agent.tool_name_to_id.get(tool_name, 0)
 
-        # HYBRID routing + TTFT (max_tokens=1 -> time-to-first-arg-token).
-        t0 = time.perf_counter()
-        tool_name, _, meta = agent.generate_via_hybrid(msgs, max_tokens=1)
-        ttft_hybrid.append((time.perf_counter() - t0) * 1e3)
-        if meta.get("ir_tokens"):
-            ir_toks.append(meta["ir_tokens"])
-        hit = bool(tool_name) and (gold in tool_name or tool_name in gold)
-        routing_hits += int(hit)
-        routed_ok = tool_name == gold          # exact: arg schema is only valid if tool is right
-        rid = agent.tool_name_to_id.get(tool_name, 0)
+                # ORACLE arm (full schema text) -> TTFT baseline
+                if rid:
+                    t0 = time.perf_counter()
+                    agent.generate_via_hybrid(msgs, max_tokens=1, schema_text=full_schema_text(agent, rid))
+                    ttft_oracle.append((time.perf_counter() - t0) * 1e3)
 
-        # ORACLE arm (full schema text) -> TTFT baseline only (informational speedup ref).
-        if rid:
-            t0 = time.perf_counter()
-            agent.generate_via_hybrid(msgs, max_tokens=1, schema_text=full_schema_text(agent, rid))
-            ttft_oracle.append((time.perf_counter() - t0) * 1e3)
+                # gold-args eval
+                if idx < args.cons_n and rid and idx in GOLD_ARGS:
+                    _, h_args, _ = agent.generate_via_hybrid(msgs, max_tokens=args.max_tokens)
+                    cmp = compare_to_gold(h_args, GOLD_ARGS[idx])
+                    cmp.update({"case": idx, "gold_tool": gold, "pred_tool": tool_name,
+                                "routed_ok": routed_ok, "hybrid": h_args, "gold": GOLD_ARGS[idx]})
+                    cons_records.append(cmp)
+                    
+            # Compute token compression ratio dynamically for this registry
+            raw_lens, ir_lens = [], []
+            for tool in tools:
+                raw_schema = json.dumps({"name": tool["name"], "inputSchema": tool.get("inputSchema") or tool.get("input_schema") or {}}, separators=(",", ":"))
+                raw_tok_len = len(llm.tokenize(raw_schema.encode("utf-8"), add_bos=False, special=False))
+                raw_lens.append(raw_tok_len)
+                
+                sig = agent._compress_schema_to_ir(tool)
+                ir_tok_len = len(llm.tokenize(sig.encode("utf-8"), add_bos=False, special=False))
+                ir_lens.append(ir_tok_len)
+            avg_raw = statistics.mean(raw_lens) if raw_lens else 1.0
+            avg_ir = statistics.mean(ir_lens) if ir_lens else 1.0
+            token_savings = (1.0 - (avg_ir / avg_raw)) * 100.0
+            runs_token_savings.append(token_savings)
+            
+            # Calculate accuracies
+            n = len(cases)
+            routed_records = [r for r in cons_records if r.get("routed_ok")]
+            
+            # 1. Routed-Only Parameter Accuracy
+            tot_spec = sum(r["n_specified"] for r in routed_records)
+            tot_correct = sum(r["n_correct"] for r in routed_records)
+            arg_acc_routed = (tot_correct / tot_spec) * 100.0 if tot_spec else 0.0
+            
+            # 2. End-to-End (E2E) Parameter Accuracy
+            tot_spec_e2e = sum(r["n_specified"] for r in cons_records)
+            tot_correct_e2e = sum(r["n_correct"] if r.get("routed_ok") else 0 for r in cons_records)
+            arg_acc_e2e = (tot_correct_e2e / tot_spec_e2e) * 100.0 if tot_spec_e2e else 0.0
 
-        # v1.6 gold-args eval: generate Hybrid args ONCE, compare to GOLD_ARGS[idx].
-        # Mis-routed cases are recorded (routed_ok=False) but excluded from the accuracy
-        # denominator in the summary -- the wrong tool's schema makes field scoring moot.
-        if idx < args.cons_n and rid and idx in GOLD_ARGS:
-            _, h_args, _ = agent.generate_via_hybrid(msgs, max_tokens=args.max_tokens)
-            cmp = compare_to_gold(h_args, GOLD_ARGS[idx])
-            cmp.update({"case": idx, "gold_tool": gold, "pred_tool": tool_name,
-                        "routed_ok": routed_ok, "hybrid": h_args, "gold": GOLD_ARGS[idx]})
-            cons_records.append(cmp)
-
-        if (idx + 1) % 20 == 0:
-            print(f"  ...{idx + 1}/{len(cases)}  routing_hit_rate={routing_hits/(idx+1):.3f}")
-
-    # V3 coreference micro-benchmark (Hybrid).
-    coref = []
-    for fx in coreference_fixture():
-        name, args_json, _ = agent.generate_via_hybrid(fx["messages"], max_tokens=args.max_tokens)
-        tool_ok = bool(name) and (fx["tool"] in name or name in fx["tool"])
-        arg_ok = bool(args_json) and (fx["must_contain"] in args_json)
-        coref.append({"name": fx["name"], "gold_tool": fx["tool"], "pred_tool": name,
-                      "tool_ok": tool_ok, "referent": fx["must_contain"],
-                      "arg_ok": arg_ok, "args": args_json})
-
-    n = len(cases)
-    routed_records = [r for r in cons_records if r.get("routed_ok")]
-    tot_spec = sum(r["n_specified"] for r in routed_records)
-    tot_correct = sum(r["n_correct"] for r in routed_records)
-    summary = {
-        "arm": "V1.9_HYBRID (bare typed IR, no exemplar/desc; gold-args eval; kebab-case; truncation-resilient)",
-        "n_routing": n,
-        "routing_accuracy": routing_hits / n if n else 0.0,
-        "ir_tokens_p50": pct(ir_toks, 50), "ir_tokens_p99": pct(ir_toks, 99),
-        "n_consistency": len(cons_records),
-        "n_routed_ok": len(routed_records),
-        # GATE 2: accuracy over specified gold fields, ROUTED-OK cases only.
-        "specified_arg_accuracy": (tot_correct / tot_spec) if tot_spec else None,
-        "specified_fields_total": tot_spec,
-        "specified_fields_correct": tot_correct,
-        # GATE 1: any <placeholder> in any generated value (across all records).
-        "placeholder_leak_count": sum(1 for r in cons_records if r.get("leak")),
-        # GATE 4: JSON validity across all generated arg records.
-        "json_valid_rate_hybrid": sum(r["parse_ok"] for r in cons_records) / len(cons_records) if cons_records else None,
-        "repair_count": sum(1 for r in cons_records if r.get("repaired")),
-        # GATE 3: serial time-to-first-arg-token.
-        "ttft_first_arg_token_ms_hybrid_p50": pct(ttft_hybrid, 50),
-        "ttft_first_arg_token_ms_oracle_fullschema_p50": pct(ttft_oracle, 50),
-        "coref_tool_acc": sum(c["tool_ok"] for c in coref) / len(coref) if coref else None,
-        "coref_arg_acc": sum(c["arg_ok"] for c in coref) / len(coref) if coref else None,
-    }
-
+            # Exact integer counts for honest Wilson CIs (case-level and argument-level denominators)
+            last_counts = {
+                "n_cases": n, "routing_hits": routing_hits, "n_cons_records": len(cons_records),
+                "n_routed_records": len(routed_records),
+                "tot_spec_routed": tot_spec, "tot_correct_routed": tot_correct,
+                "tot_spec_e2e": tot_spec_e2e, "tot_correct_e2e": tot_correct_e2e,
+            }
+            
+            runs_routing_acc.append((routing_hits / n) * 100.0 if n else 0.0)
+            runs_arg_acc_routed.append(arg_acc_routed)
+            runs_arg_acc_e2e.append(arg_acc_e2e)
+            runs_placeholder_leaks.append(sum(1 for r in cons_records if r.get("leak")))
+            runs_json_valid.append((sum(r["parse_ok"] for r in cons_records) / len(cons_records) * 100.0) if cons_records else 0.0)
+            runs_ttft_hybrid.append(pct(ttft_hybrid, 50))
+            runs_ttft_oracle.append(pct(ttft_oracle, 50))
+            last_ir_toks = ir_toks
+                
+        # Aggregate runs
+        def stats(vals):
+            if not vals:
+                return 0.0, 0.0
+            return statistics.mean(vals), (statistics.stdev(vals) if len(vals) > 1 else 0.0)
+            
+        m_routing, s_routing = stats(runs_routing_acc)
+        m_arg_routed, s_arg_routed = stats(runs_arg_acc_routed)
+        m_arg_e2e, s_arg_e2e = stats(runs_arg_acc_e2e)
+        m_leak, _ = stats(runs_placeholder_leaks)
+        m_valid, s_valid = stats(runs_json_valid)
+        m_ttft_h, _ = stats(runs_ttft_hybrid)
+        m_ttft_o, _ = stats(runs_ttft_oracle)
+        m_savings, _ = stats(runs_token_savings)
+        
+        _ir_all = [t for t in (last_ir_toks or []) if t]
+        overall_results[size] = {
+            "routing_accuracy": m_routing, "routing_accuracy_std": s_routing,
+            "arg_accuracy_routed_only": m_arg_routed, "arg_accuracy_routed_only_std": s_arg_routed,
+            "arg_accuracy_e2e": m_arg_e2e, "arg_accuracy_e2e_std": s_arg_e2e,
+            "placeholder_leak_count": m_leak,
+            "json_valid_rate_hybrid": m_valid, "json_valid_rate_hybrid_std": s_valid,
+            "ir_tokens_p50": (statistics.median(_ir_all) if _ir_all else 0.0),
+            "ir_tokens_p99": (pct(_ir_all, 99) if _ir_all else 0.0),
+            "ttft_hybrid_p50_ms": m_ttft_h,
+            "ttft_oracle_p50_ms": m_ttft_o,
+            "token_savings_pct": m_savings,
+            "counts": last_counts,
+        }
+        
+    # Write summary artifact
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    artifact = {"summary": summary, "consistency_records": cons_records, "coref": coref}
     out_path = out_dir / ("accuracy_smoke.json" if args.smoke else "accuracy.json")
-    out_path.write_text(json.dumps(artifact, indent=2))
-
-    print("\n=== V1.9 SIDECAR ACCURACY / GOLD-ARGS ===")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print("\n  coreference:")
-    for c in coref:
-        print(f"    {c['name']:32s} tool_ok={c['tool_ok']} arg_ok={c['arg_ok']} "
-              f"pred={c['pred_tool']!r} ref={c['referent']!r}")
-    print(f"\n  artifact -> {out_path}")
+    out_path.write_text(json.dumps(overall_results, indent=2))
+    
+    print("\n" + "="*80)
+    print("                      SIDECAR COMPARATIVE SCALING CURVE")
+    print("="*80)
+    print(f"{'Size (N)':<8} | {'Route Acc':<12} | {'Arg (Routed)':<14} | {'Arg (E2E)':<12} | {'TTFT (H/O)':<16} | {'Token Save':<10}")
+    print("-"*80)
+    for size in sizes:
+        res = overall_results[size]
+        route_str = f"{res['routing_accuracy']:.1f}%"
+        arg_r_str = f"{res['arg_accuracy_routed_only']:.1f}%"
+        arg_e_str = f"{res['arg_accuracy_e2e']:.1f}%"
+        ttft_str = f"{res['ttft_hybrid_p50_ms']:.0f}/{res['ttft_oracle_p50_ms']:.0f} ms"
+        tok_str = f"{res['token_savings_pct']:.1f}%"
+        print(f"{size:<8} | {route_str:<12} | {arg_r_str:<14} | {arg_e_str:<12} | {ttft_str:<16} | {tok_str:<10}")
+    print("="*80)
+    print(f"Wrote JSON artifact: {out_path}")
+    
+    if os.path.exists("test/schemas/jit_bloat"):
+        import shutil
+        shutil.rmtree("test/schemas/jit_bloat")
+        
     return 0
 
 
