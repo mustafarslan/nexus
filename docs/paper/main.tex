@@ -123,13 +123,15 @@ We are explicit about scope. All benchmarks were executed on an Apple M4 Max SoC
 %% ============================================================
 \emph{Tool retrieval and schema compression.} The two standard responses to schema bloat both
 act before the model. Retrieval-augmented tool selection---exemplified by
-RAG-MCP~\cite{ragmcp2025}, which is precisely the retrieve-$K$-and-prefill baseline we compare
-against---fetches only the relevant MCP schemas prior to prefill. Schema-level
+RAG-MCP~\cite{ragmcp2025}---fetches only the relevant MCP schemas prior to prefill. Schema-level
 compilation~\cite{tscg2026} and learned latent tool retrieval~\cite{ntilc2026} shrink or replace
 tool descriptions at the application and embedding levels, the latter requiring trained
-alignment. Nexus adopts retrieval to decouple routing but adds a complementary system-level lever:
-direct KV transplantation for the schemas that remain, with a zero-shot calibrated margin gate over
-frozen embeddings.
+alignment. Nexus adopts the same retrieval principle to decouple routing but adds a complementary
+system-level lever: direct KV transplantation for the schemas that remain, with a zero-shot
+calibrated margin gate over frozen embeddings. We position Nexus against RAG-MCP and in-place
+KV-serving systems in Table~\ref{tab:comparison}; because those numbers are reported on different
+hardware and workloads, we treat them as contextual rather than a controlled head-to-head, which
+we leave to future work.
 
 \emph{KV-cache management for serving.} Paged and prefix-shared KV
 management~\cite{kwon2023vllm,zheng2024sglang} and dynamic virtual-memory
@@ -151,6 +153,29 @@ determines the V-cache layout that dictates our transposed-V handling. Constrain
 decoding~\cite{willard2023outlines,beurer2023lmql,guidance2023} underlies the FSM/JSON masking used
 for argument generation. Nexus targets a different regime---relocating compiled schema blocks under
 unified memory---and we make no outperformance claim against these systems. The SLB scan mechanism and \code{.atb} page alignment build directly on the neuro-symbolic memory substrate (Memory Palace/Atlas index, Trace DAG, SLB) introduced in Aeon v3~\cite{arslan2026aeon}, extending them to direct, zero-copy physical cache transplantation under UMA.
+
+\begin{table*}[t]
+\centering
+\caption{Nexus in context. In-place KV-serving systems never relocate a compiled block; Nexus
+relocates per-tool blocks and decouples routing from the splice path. Non-Nexus numbers are
+reported on different hardware and workloads ($\dagger$: contextual, \emph{not} a controlled
+head-to-head; see \code{results/comparison\_sources.md}).}
+\label{tab:comparison}
+\footnotesize
+\begin{tabular}{@{}llllll@{}}
+\toprule
+System & KV strategy & Routing & Reported metric & Workload / HW & H2H? \\
+\midrule
+RAG-MCP~\cite{ragmcp2025}                  & in-place (prompt-level)      & retrieve-$K$ + prefill & $43.1\%$ vs $13.6\%$ tool-sel.; ${>}50\%$ tokens$^\dagger$ & MCP stress test, LLM eval & no \\
+vLLM / PagedAttn~\cite{kwon2023vllm}       & in-place (paged)             & ---                    & $2\text{--}4\times$ throughput$^\dagger$                   & ShareGPT, A100/A10G       & no \\
+SGLang / RadixAttn~\cite{zheng2024sglang}  & in-place (prefix reuse)      & ---                    & up to $6.4\times$ throughput$^\dagger$                     & LLM programs, A10G/A100   & no \\
+vAttention~\cite{vattention2025}           & in-place (virtual contig.)   & ---                    & up to $1.23\times$ vs paged$^\dagger$                      & GPU serving               & no \\
+RedKnot~\cite{redknot2026}                 & in-place (head-aware)        & ---                    & resource efficiency (qual.)$^\dagger$                      & GPU serving               & no \\
+\midrule
+\textbf{Nexus} (this work)                 & \textbf{relocate} (per-tool) & SLB + margin gate      & routing $89\%$@250; first-arg $1.66\times$; splice $1.1\text{--}1.7\times$ & GitHub-MCP, M4 Max UMA, Qwen2.5-14B & --- \\
+\bottomrule
+\end{tabular}
+\end{table*}
 
 %% ============================================================
 \section{Background and Motivation}
