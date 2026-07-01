@@ -1,4 +1,0 @@
-arm,tool_hit_accuracy,ttft_p50_ms,ttft_p90_ms,ttft_p99_ms,n_queries
-B1_Bloat,0.98,12345.67,12756.23,14741.70,100
-B3_Baseline,0.92,1498.63,2097.95,2358.28,100
-Nexus_Production,0.89,237.39,309.96,398.60,100

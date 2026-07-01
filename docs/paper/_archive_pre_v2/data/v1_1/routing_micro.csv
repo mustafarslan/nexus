@@ -1,6 +1,0 @@
-# GENERATED from results/v1.1_canonical/ by regen_canonical_paper_data.py. TRUE TTFT (incl. first token) unless noted.
-metric,value,unit,n,source
-gateway_route_splice_p50,160.2,ms,500,"gateway_run[1-5] (route-only, decode_us=0)"
-gateway_accuracy,0.89,frac,500,gateway_run[1-5]
-l0_copy_p50,3.06,us,10,l0_seed_[0-9]
-l0_hit_rate,69.5,pct,10,l0_seed_[0-9]

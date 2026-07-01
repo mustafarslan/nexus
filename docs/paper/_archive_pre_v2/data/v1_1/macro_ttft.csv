@@ -1,5 +1,0 @@
-# GENERATED from results/v1.1_canonical/ by regen_canonical_paper_data.py. TRUE TTFT (incl. first token) unless noted.
-arm,ttft_p50_ms,ttft_p90_ms,ttft_p99_ms,accuracy,n
-B_FC (full-context),9754.4,11266.7,14879.5,0.9666666666666667,30
-B_RP (retrieve+prefill),1214.1,1791.9,1978.4,0.9333333333333333,30
-Nexus (N1x),518.4,603.0,722.9,0.8666666666666667,30

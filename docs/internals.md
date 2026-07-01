@@ -7,8 +7,8 @@ contributor will otherwise hit. It pairs with [architecture.md](architecture.md)
 model) and the [README](../README.md) (the headline and scope).
 
 **Validation anchor.** Canonical tuple: Qwen2.5-14B-Instruct Q4_K_M (`model_hash a09ea5e7`),
-`llama_cpp`/`llama.cpp` build `cb2463bb`, one Apple-Silicon host, git `3ea7441`. Authoritative
-artifacts under `results/v1.1_canonical/`; the manifest is the source of truth.
+`llama_cpp`/`llama.cpp` build `cb2463bb`, one Apple-Silicon host, git `1ce4aa4`. Authoritative
+artifacts under `results/v2.0_canonical/`; the manifest is the source of truth.
 
 > **Two "Radix" types, do not conflate them.** `NexusRadixPrefixCache`
 > (`nexus_seq_warm_cache.{cpp,hpp}`) is the **L0 warm KV prefix cache**. `NexusRadixFSM`
@@ -184,24 +184,20 @@ H5 did two things. **Regenerated (live):**
 
 ## 11. Artifact taxonomy — canonical vs raw vs legacy
 
-`results/v1.1_canonical/CANONICAL_RESULTS_MANIFEST.json` is the authority. Categories:
+`results/v2.0_canonical/MANIFEST.json` is the authority. Categories:
 
 | Class | Where | Meaning |
 | --- | --- | --- |
-| **Canonical** | `v1.1_canonical/phaseH/*`, `v1.1_canonical/raw/*` | Frozen 2026-06-20; reproducible on the pinned stack; the live source of truth |
-| **Raw** | `v1.1_canonical/raw/` | Per-seed / per-run inputs behind the pooled canonical metrics (10 gateway runs, 10 L0 seeds, e2e runs) |
-| **Deprecated** | top-level `results/*.json` (e.g. `bench_gateway_e2e_v2.json`) | Superseded; stamped in-place with a `_deprecation` key; kept for cross-run comparison only |
-| **Quarantined** | `results/_quarantine_2026-06-20/*.orig` | Pristine copies of superseded artifacts; not live |
-| **Legacy / retired** | tensor-KL `0.0076`/`5.72` prose; `171`/`237.4 ms` route-only headlines | Do not cite as live evidence |
+| **Canonical** | `v2.0_canonical/*` | Frozen 2026-07-01; reproducible on the pinned stack; the live source of truth |
+| **Raw** | `v2.0_canonical/raw/` | Per-seed / per-run inputs behind the pooled canonical metrics |
+| **Legacy / retired** | LegoLink scattered partial-recompute `5.72` KL; reference-free gating proxy | Do not cite as live evidence for production path |
 
 Primary canonical artifacts you will actually read:
 
-- `phaseH/h3_e2e_n100.json` — the TTFT headline.
-- `phaseH/PHASE_H_H1_SECONDMODEL_REVIEW.md` — the scope precondition.
-- `phaseH/slb_scalability_H5.csv`, `phaseH/splice_fidelity_anchored_H5.json` — H5.
-- `phaseH/recall_miss_analysis_H4.json`, `phaseH/margin_calibration_H4.json` — routing/calibration.
-- `phaseH/PHASE_H_TENSORKL_BOUNDARY_REVIEW.md`, `tensor_boundary_canary_5pct.json`,
-  `logit_kl_boundary_phaseA.json` — the boundary retirement and its replacements.
+- `raw/deep_splice_ttft.json` — the TTFT latency under deep splice curves.
+- `raw/dkl_sweep.json` — the next-token D_KL vs splice offset sweep.
+- `raw/routing_accuracy_n250.json` — routing accuracy vs registry scale.
+- `raw/sidecar/accuracy.json` — hybrid sidecar routing & argument accuracies.
 
 ## 12. Developer warnings — what NOT to assume
 

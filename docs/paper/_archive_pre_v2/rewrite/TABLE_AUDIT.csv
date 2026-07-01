@@ -1,7 +1,0 @@
-table,prior_source,prior_values,canonical_source,decision,new_values_or_label
-tab:e2e-macro,"hardcoded inline (Run B)","BFC 12.35s/0.98, BRP 1.50s/0.92, Nexus 237.4ms/0.89",results/v1.1_canonical/raw/e2e_clean_n30.json,REGENERATE,"BFC 9754ms/0.97, BRP 1214ms/0.93, N1x 518ms/0.87 (true TTFT, n=30). Route-only 160ms moved to micro section."
-tab:routing-micro (new),n/a,n/a,gateway_run[1-5].json + l0_seed_[0-9].json,ADD,"gateway route-only 160.2ms (n=500, NOT TTFT); L0 3.06us/69.5% (n=10)"
-tab:ablation,"ml_ablation_table.csv (n=100, separate harness)","dense 0.87/248.7, v0 0.85/292, v1 0.89/307.9",NOT regenerated,KEEP_BUT_LABEL_LEGACY,"Kept for qualitative finding (uncalibrated CE degrades acc); TTFT column labeled legacy/not-comparable"
-tab:physics (RoPE),"physics_boundary_rope.csv (pre-freeze)","P256 KL0.0076; P1024 LegoLink KL5.72",NOT regenerated (pre-freeze) + g4_gate_verdict.json corroborates,KEEP_BUT_LABEL_PREFREEZE,"Explicit pre-freeze label; motivating not headline; regeneration flagged as required future work"
-tab:scalability (SLB),"scalability_curve.csv (pre-freeze)","SLB 1.7->21.5us; e2e_ttft n=10",NOT regenerated,REMOVE_FROM_MAIN,"Removed as a table/figure from main.tex; SLB 4.19us cited inline as legacy only"
-tab:l0-radix (PAPER_TABLES),"l0_radix_metrics.csv","69.5%/3.042us",l0_seed_[0-9].json,KEEP,"3.06us median canonical; folded into routing-micro"

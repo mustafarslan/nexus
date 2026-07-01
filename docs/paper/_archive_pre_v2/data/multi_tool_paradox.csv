@@ -1,4 +1,0 @@
-# Data sourced from architectural validation records prior to V1.0 codebase freeze.
-topology,tensor_kl,e2e_routing_accuracy,diagnosis,source_note
-Single Tool Splice (N1),0.0076,0.91,Causally sound,Data sourced from architectural validation records prior to V1.0 codebase freeze.
-Multi-Tool Blockmask (N1m),0.0,0.0,Cross-Attention Blinding (Causal Isolation),Data sourced from architectural validation records prior to V1.0 codebase freeze.

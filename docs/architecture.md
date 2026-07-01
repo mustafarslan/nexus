@@ -6,8 +6,8 @@ It pairs with [internals.md](internals.md) (implementation truth) and the
 [README](../README.md) (the headline and scope).
 
 **Validation anchor.** Everything benchmarked here is the canonical tuple: Qwen2.5-14B-Instruct
-Q4_K_M, `llama_cpp`/`llama.cpp` build `cb2463bb`, one Apple-Silicon host, git `3ea7441`,
-frozen under `results/v1.1_canonical/`.
+Q4_K_M, `llama_cpp`/`llama.cpp` build `cb2463bb`, one Apple-Silicon host, git `1ce4aa4`,
+frozen under `results/v2.0_canonical/`.
 
 ---
 

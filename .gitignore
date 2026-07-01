@@ -20,10 +20,17 @@ __pycache__/
 *.so
 *.dylib
 
-# Logs and local caches
+# Logs, LaTeX, and local caches
 *.log
 *.npz
 .DS_Store
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.out
+*.synctex.gz
 
 # IDE
 .vscode/
@@ -31,10 +38,16 @@ __pycache__/
 
 # Local/scratch folders
 scratch/
+checkpoints/
+
+# AI assistant configs
+.claude/
 
 # Test generated/bloat files
 test/schemas/bloat/
+test/schemas/jit_bloat/
 test/schemas/bloat_embeddings.npz
 test/schemas/bloat_metadata.json
 test/schemas/test.db
 test/schemas/slb_manifest.json
+test/schemas/*.atb
