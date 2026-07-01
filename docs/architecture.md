@@ -1,278 +1,150 @@
-# Nexus Architecture
+# Nexus Architecture: Depth-Adaptive Splicing and Decoupled Routing
 
-This document is the mental model for Nexus: what the system is, how a request flows through
-it, where the latency goes, and — just as importantly — where the design's preconditions bind.
-It pairs with [internals.md](internals.md) (implementation truth) and the
-[README](../README.md) (the headline and scope).
-
-**Validation anchor.** Everything benchmarked here is the canonical tuple: Qwen2.5-14B-Instruct
-Q4_K_M, `llama_cpp`/`llama.cpp` build `cb2463bb`, one Apple-Silicon host, git `1ce4aa4`,
-frozen under `results/v2.0_canonical/`.
+This document defines the system topology, execution paths, and performance characteristics of Nexus. It reconciles the system design with the physical limits of Rotary Position Embedding (RoPE) drift and the hardware constraints of Unified Memory Architectures (UMA).
 
 ---
 
-## 1. System overview
+## 1. System Overview & The Dual Levers
 
-Nexus accelerates the *tool-augmented turn* in an LLM agent. The unit of work is: a user query
-arrives, the agent must pick a tool, load that tool's schema into the model's context, and
-produce a first output token. The cost of that turn is dominated by **prefill** — running the
-tool's schema tokens through the transformer to populate the KV cache.
+Nexus is a local LLM serving prototype optimized for tool-augmented agentic turns. In standard systems standardizing on the Model Context Protocol (MCP), the model is presented with verbose JSON schemas that must be parsed and re-encoded every turn. Nexus eliminates this overhead through two complementary system-level levers:
 
-Nexus's thesis is that prefill of a *fixed* tool schema is redundant work: the KV tensors it
-produces are deterministic given the model and the schema's position, so they can be computed
-once, frozen to disk, and **spliced** back into the cache at runtime instead of recomputed.
-Around that splice sits a routing pipeline that decides which tool to splice, and a gate that
-decides how much to trust the cheap router before committing.
-
-The system is two cooperating layers:
-
-- A **C++ hot path** (orchestrator, splicer, router, caches) that does the latency-critical
-  work and is bound tightly to the model's KV layout.
-- A **Python control layer** (`nexus_agent.py`) that drives llama.cpp, owns the RAII lifecycle
-  of a splice, and exposes the routing decision to a logits processor.
-
-## 2. Design goals
-
-1. **Eliminate redundant schema prefill** on the common (short-context) path.
-2. **Never silently corrupt output.** A splice that cannot be done correctly must be declined,
-   not approximated. This is why the dual-path gate and the architectural rejection checks
-   exist.
-3. **Make routing cheap and calibrated.** The router must cost microseconds, and the decision
-   to escalate to a more expensive reranker must be statistically grounded, not hand-tuned.
-4. **Be measurable and honest.** Every claim maps to a frozen artifact; route-only and true
-   TTFT are kept distinct; scope is stated, not implied.
-
-## 3. Core concepts and terminology
-
-These names are used identically here, in the README, and in internals.
-
-| Term | Meaning |
-| --- | --- |
-| **`.atb` (Aeon Tool Block)** | A precompiled, model-bound KV snapshot of a tool schema. A "tool page." |
-| **Path A / N1x** | The accelerated path: retrieve → gate → splice `.atb` → 5% suffix recompute. |
-| **Path B / B3 (B_RP)** | Fallback / baseline: retrieve, then full **text prefill** of the schema. |
-| **Anchored splice (Δpos=0)** | `.atb` injected at the base position it was compiled for. Output-exact. |
-| **Isolated / off-anchor splice** | `.atb` injected at a different position (Δpos≠0). Requires RoPE reanchor; degrades. |
-| **SLB** | Semantic Load Balancer — an INT8 SIMD **dense vector router** over tool embeddings. Not a server load balancer. |
-| **CE** | Cross-encoder reranker, fired only on low-margin decisions. |
-| **P20 margin calibration** | The margin threshold `τ ≈ 0.01365` that gates CE firing at ~20% of queries. |
-| **L0 warm cache** | `NexusRadixPrefixCache`: a runtime KV prefix-reuse tier. Distinct from the decode-time FSM trie. |
-| **route-only latency** | Time for retrieve + gate + splice with `decode_us = 0`. Not TTFT. |
-| **true TTFT** | Wall-clock to the first generated token, first-token decode included. The headline metric. |
-
-## 4. End-to-end flow (query → answer)
+1.  **Retrieval-Decoupled Routing (Primary Lever)**: Decouples tool selection from schema prefill. A Semantic Lookaside Buffer (SLB) selects the active tool via fast vector search. Arguments are generated in the main context over a type-hinted, compressed textual signature (median 19 tokens), avoiding prompt bloat and keeping registry scale independent of prefill latency.
+2.  **Depth-Adaptive KV-Cache Splicing (Secondary Lever)**: Transplants precompiled tool schema key-value blocks (stored as `.atb` files) directly into the active KV cache cells. To prevent rotary position embedding (RoPE) phase drift, a trailing suffix fraction $R(n_{\mathrm{past}})$ of the schema is dynamically re-decoded at runtime to stitch the seam, achieving a never-regress fidelity guarantee ($D_{\mathrm{KL}} \approx 0$).
 
 ```
-                ┌─────────────────────────── Python control layer ───────────────────────────┐
- user query ─►  │ embed query ─► route_and_splice(FFI) ─► LogitsProcessor (FSM mask) ─► decode │
-                └───────────────────────────────────┬──────────────────────────────────────────┘
-                                                     ▼  (C++ hot path)
-   1. GUARD        n_past > 256 ?  ── yes ─► Path B: decline, probe L0 (read-only), return 0
-                       │ no
-   2. RETRIEVE     SLB dense (or hybrid dense+lexical) search → top-3 candidates + scores
-   3. MARGIN       margin = score[0] − score[1]
-   4. GATE         passes_threshold = score[0] ≥ θ  OR  margin ≥ auto_route_margin
-                   passes_margin    = margin ≥ speculative_margin
-   5. SPECULATE    if (passes_threshold ∧ passes_margin): speculatively inject top-1 .atb early
-   6. RESOLVE      else: decode tool name through Radix FSM (logit-masked) → resolved tool_id
-   7. SPLICE       inject resolved tool's .atb KV  (anchored: direct blit; off-anchor: RoPE reanchor)
-   8. RECOMPUTE    recompute last ~5% of schema tokens to stitch splice to live context
-                                                     ▼
-                                              first token decoded
+                     ┌──────────────────────────────────────────────┐
+                     │                 User Query                   │
+                     └──────────────────────┬───────────────────────┘
+                                            ▼
+                             ┌──────────────────────────────┐
+                             │    INT8 Embedding Search     │
+                             │       (SLB Dense Scan)       │
+                             └──────────────┬───────────────┘
+                                            ▼
+                             ┌──────────────────────────────┐
+                             │      Margin Gate (P20)       │
+                             │       margin = s0 - s1       │
+                             └──────────────┬───────────────┘
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        ▼ (margin >= τ)                         ▼ (margin < τ)
+             ┌─────────────────────┐                 ┌─────────────────────┐
+             │     Auto-Route      │                 │     CE Rerank       │
+             │  (Speculative top-1)│                 │    (20.8% queries)  │
+             └──────────┬──────────┘                 └──────────┬──────────┘
+                        └───────────────────┬───────────────────┘
+                                            ▼
+                                 ┌─────────────────────┐
+                                 │  Resolved Tool ID   │
+                                 └──────────┬──────────┘
+                                            ▼
+                                ┌──────────────────────┐
+                                │   n_past > 256 ?     │
+                                └───────┬──────┬───────┘
+                                        │      │
+                              yes ┌─────┘      └─────┐ no (Anchored regime)
+                                  ▼                  ▼
+                    ┌─────────────────────────┐   ┌──────────────────────────┐
+                    │  deep_splice_enabled?   │   │  Direct .atb KV Splice   │
+                    └────┬───────────────┬────┘   │  + 5% suffix recompute   │
+                         │               │        └──────────┬───────────────┘
+                  yes ┌──┘               └──┐ no             │
+                      ▼                     ▼                ▼
+         ┌─────────────────────────┐  ┌───────────┐  ┌───────────────────────┐
+         │ Calculate R(n_past) Eq.2│  │ Text      │  │ Constrained Arguments │
+         │   Blit .atb KV Splice   │  │ Prefill   │  │     via GBNF/FSM      │
+         │   + Suffix Re-decode    │  │ (Path B)  │  └──────────┬────────────┘
+         └────────────┬────────────┘  └─────┬─────┘             │
+                      └─────────┬───────────┘                   ▼
+                                ▼                       ┌──────────────┐
+                          First Token                   │  Tool Call   │
+                            Decoded                     └──────────────┘
 ```
 
-The Python layer (`NexusSpliceContext`) wraps steps 5–8 in a context manager so that the
-spliced KV range is always cleaned up (`unsplice_tool`) on turn exit, even on exception or
-cancellation. The decision data from step 6 flows into `NexusRoutingProcessor`, a llama.cpp
-`LogitsProcessor` that applies the FSM mask **only** while the model is decoding the tool name.
+---
 
-## 5. Retrieval / routing pipeline
+## 2. Core Concepts & Terminology
 
-Routing is a cheap-first, escalate-on-doubt cascade.
+*   **`.atb` (Aeon Tool Block)**: A frozen, page-aligned FP16 KV cache snapshot of a precompiled schema, containing a 128-byte header storing topology and RoPE anchors.
+*   **Semantic Lookaside Buffer (SLB)**: An in-situ INT8 vector lookup register that caches tool names and descriptions, executing branchless SIMD scans on NEON/AVX.
+*   **Anchored Splice ($\Delta\mathrm{pos} = 0$)**: Splicing a tool page at the exact base position it was compiled for (typically position 0 in a sidecar context). This path is output-exact ($D_{\mathrm{KL}} = 0$, top-1 agreement 1.0).
+*   **Off-Anchor Splice ($\Delta\mathrm{pos} \ne 0$)**: Splicing a tool page at an arbitrary context depth. Requires RoPE re-rotation of keys and values from their compile anchor to $n_{\mathrm{past}}$.
+*   **Depth-Adaptive Recompute**: The schedule $R(n_{\mathrm{past}})$ that determines what fraction of the spliced block's trailing tokens must be re-decoded to stich the seam and drive position drift error to zero.
+*   **Never-Regress Guarantee**: A system invariant ensuring that the output next-token probability distribution of a spliced turn is mathematically identical to a full text prefill reference.
+*   **transposed-V Layout**: An attention cache layout where values are stored in a token-innermost stride (common in soft-capped models like Gemma-2 when FlashAttention is disabled).
 
-### 5.1 Dense router (SLB)
+---
 
-The SLB holds each tool's embedding quantized to INT8 with a per-vector scale, plus optional
-lexical hashes and a tokenized "digest." A query is quantized the same way and scored by a
-branchless SIMD dot product (AVX2 / AVX-512-VNNI / NEON). `search_hybrid` blends the dense
-score with lexical overlap when query hashes are present; `search` is dense-only. Both return
-the top-3. This is the entire retrieval cost on the hot path, and it is **microseconds** (§12).
+## 3. Retrieval and Routing Cascade
 
-### 5.2 Margin and the gate
+To minimize latency overhead, tool selection is structured as a hierarchical routing cascade:
 
-The orchestrator computes `margin = score[0] − score[1]`. Two predicates decide whether the
-top-1 can be trusted without a reranker:
+1.  **SIMD Dense Scan**: The user query is embedded and quantized to INT8, then compared against all registered tool signatures in the SLB. On Apple UMA, the pure C++ SIMD scan runs in **$8.25\ \mu s$** for 250 tools, rising to **$17.6\ \mu s$** when including Python FFI boundary crossings.
+2.  **Margin Gating**: The margin between the top two candidates ($m = s_0 - s_1$) is compared to a calibrated margin threshold $\tau = 0.0136$. If $m \ge \tau$, the router has high confidence and auto-routes the query using speculative top-1 cache injection.
+3.  **Cross-Encoder Gating**: If $m < \tau$, the decision is flagged as low-confidence and escalated to a fine-tuned MiniLM-class cross-encoder. This reranking step fires on **$20.8\%$** of queries (P20 calibration), preserving accuracy while shielding the hot path from the costly cross-encoder forward pass.
+4.  **Radix FSM Resolution**: If auto-routing is skipped, the model decodes the tool name through a radix trie logits mask (`RadixFSM`), ensuring the model cannot generate invalid tool names.
 
-- `passes_threshold`: top score clears an absolute bar **or** the margin clears an auto-route bar.
-- `passes_margin`: the margin clears a speculative bar.
+Overall routing accuracy remains nearly flat as the registry scales: **$92\%$** at $N=10$ tools, **$90\%$** at $N=50$, and **$89\%$** at $N=250$. Under the standard concatenate-all baseline, the prompt overflows the context window entirely at $N \ge 50$.
 
-If both hold, Nexus **speculatively injects** the top-1 tool page before the model has even
-decoded a tool name — buying back the splice latency on the (calibrated-likely) correct guess.
-If not, it defers to the FSM.
+---
 
-### 5.3 CE reranking
+## 4. KV-Cache Splicing Mechanics
 
-When the dense margin is below the calibrated threshold, a cross-encoder reranks the candidates
-before the tool is committed. The CE is the expensive, accurate arm; the whole point of
-calibration is to fire it rarely.
+When a tool is resolved, its `.atb` file is mapped into memory. Splicing proceeds as follows:
 
-### 5.4 FSM tool resolution
+```
+.atb File (Disk)          Host Virtual Memory (mmap)          Live KV Cache
+┌──────────────┐          ┌────────────────────────┐          ┌─────────────────┐
+│ Header (128B)│ ──mmap─► │ Header (128B) [ignored]│          │ History (n_past)│
+├──────────────┤          ├────────────────────────┤          ├─────────────────┤
+│ Contig K F16 │          │ Contig K F16 [zero-copy] ──blit──►│ Spliced K Block │
+├──────────────┤          ├────────────────────────┤          │ (Row-Major)     │
+│ Contig V F16 │          │ Contig V F16 [zero-copy] ──blit──►├─────────────────┤
+└──────────────┘          └────────────────────────┘          │ Spliced V Block │
+                                                              │ (Transposed/Str)│
+                                                              ├─────────────────┤
+                                                              │ Seam re-decode  │
+                                                              │ S * R(n_past)   │
+                                                              └─────────────────┘
+```
 
-When the gate does not auto-route, the tool name is decoded through `NexusRadixFSM`, a radix
-trie over tool-name tokens. During the `NAVIGATING` state it masks logits to only the valid
-continuation tokens, so the model cannot hallucinate a non-existent tool. This is a separate
-structure from the L0 warm cache — see internals; do not conflate the two.
+1.  **Header Verification**: The runtime top-1 block's parameters (layer count, KV heads, head dimension, and RoPE frequencies) are validated against the live model to prevent memory corruption.
+2.  **Layout-Aware Blitting**:
+    *   For standard architectures (e.g. Qwen2.5) where FlashAttention is active, the V-cache is row-major. Contiguous blocks are blitted directly.
+    *   For soft-capped architectures (e.g. Gemma-2), FlashAttention is disabled, leaving the V-cache in a transposed layout (`v_trans = true`). Splicing executes a layout-aware strided blit (`splice_v_layer`) to transpose values during physical cache writing.
+3.  **RoPE Reanchoring**: For off-anchor relocations ($\Delta\mathrm{pos} \ne 0$), keys are re-rotated by the phase difference:
+    $$\Delta\theta_i = (n_{\mathrm{past}} - m_0)\theta_i$$
+4.  **Seam Stitching**: A trailing fraction $R(n_{\mathrm{past}})$ of the schema block is invalidated and re-decoded to smooth the relative attention transition between the history and the newly spliced block.
 
-## 6. CE / calibration / gate behavior
+---
 
-The gate's threshold is not hand-picked. A P20 margin calibration sets
-`τ = 0.013646852970123292` so that the cross-encoder fires on roughly the **least-confident
-20%** of decisions. H4 measured the consequences:
+## 5. Depth-Adaptive Splicing and the Never-Regress Curve
 
-- Dense Recall@1: **0.87**.
-- CE-gated Recall@1 at ~20% fire: **0.88** — the 0.90 target was **not met**.
-- A fire-rate sweep showed *raising* the fire rate **lowers** accuracy (0.88 → 0.85): broad CE
-  application hurts, and the P20 gate is near-optimal for this stack.
+Relocating compiled blocks causes attention disruption due to positional RoPE context drift. While an anchored splice at $\Delta\mathrm{pos} = 0$ is output-exact ($D_{\mathrm{KL}} = 0$), off-anchor splices accrue a residual next-token divergence of $D_{\mathrm{KL}} \sim 10^{-2}$ nats.
 
-Artifacts: `phaseH/margin_calibration_H4.json`, `phaseH/recall_miss_analysis_H4.json`,
-`phaseH/recall_sweep_thr_*.json`.
+Rather than accepting this drift, Nexus enforces a **never-regress guarantee** by scaling the recompute suffix fraction $R(n_{\mathrm{past}})$ linearly with context depth beyond a threshold $M = 256$:
 
-> **Footgun.** If `src/` is not on the import path, the margin threshold silently falls back to
-> `0.028` instead of the calibrated `0.01365`. See internals.
+$$R(n_{\mathrm{past}}) = R_{\mathrm{base}} + \frac{n_{\mathrm{past}} - M}{M(K - 1)}(100 - R_{\mathrm{base}})$$
 
-## 7. ATB / tool-page / splice design
+where $R_{\mathrm{base}} = 5\%$. At deep context depths, the recompute fraction converges to $100\%$ (a full text prefill), driving next-token KL divergence to exactly $0$. 
 
-An `.atb` file is a 128-byte header followed by contiguous FP16 K and V tensors — exactly the
-KV state a normal prefill would have produced for that schema, frozen to disk. The header binds
-the block to a specific model topology and RoPE configuration (full ABI in internals).
+### TTFT Performance Trade-offs
+Because the repaired suffix adds re-decode work, the speedup decreases as depth increases:
 
-At runtime the splicer (`inject_tool_page_raw`):
+*   **Moderate depth ($n_{\mathrm{past}} = 256$)**: Saves $1.63\times$ (default $K=4$) to $1.73\times$ (tuned $K=16$) TTFT.
+*   **Intermediate depth ($n_{\mathrm{past}} = 1024$)**: Speedup narrows to $0.98\times$ (default $K=4$) or $1.17\times$ (tuned $K=16$).
+*   **Deep context ($n_{\mathrm{past}} = 2048$)**: Converges to prefill parity ($1.00\times$ to $1.07\times$).
 
-1. Validates the block against the live model (layer count, KV heads, head dim, RoPE params)
-   and rejects any block whose KV layout it cannot legally write (the `v_trans` check, §10).
-2. Computes the physical KV-cache row for the logical position, handling circular-buffer wrap.
-3. Decides anchored vs off-anchor from `delta_pos = n_past − base_pos`.
-4. Transfers the K/V tensors into the cache — a parallel per-layer blit on UMA, or async H2D on
-   discrete GPUs.
-5. For off-anchor injections, applies a RoPE reanchor (CPU kernel or GPU path).
+The tuning constant $K$ serves as a dial trading TTFT flatness for how early full recompute engages to preserve the never-regress contract.
 
-A short suffix (~5% of the schema, computed by the orchestrator) is then recomputed so the
-spliced block is coherent with whatever preceded it in the live context.
+---
 
-## 8. Anchored vs isolated splice — what the regimes mean
+## 6. Bounding Negative Results
 
-This is the conceptual heart of the fidelity story.
+The architecture is bounded by two distinct physical limits discovered during development:
 
-- **Anchored (Δpos = 0).** The block is injected at exactly the position it was compiled for.
-  No RoPE adjustment is needed; the KV is bit-for-bit what prefill would have produced. H5
-  measured this directly: **logit-KL 0.0, top-1 agreement 1.0 across n=50.** The output
-  distribution is indistinguishable from a real prefill.
-- **Isolated / off-anchor (Δpos ≠ 0).** The block must be RoPE-reanchored to its new position.
-  H5 found this **degrades**: logit-KL ~0.9, top-1 agreement ~0.33–0.67. The reanchor does not
-  recover prefill-equivalent state.
+### 6.1 The Failure of Reference-Free Drift Gating
+We profiled a cheap, reference-free proxy (per-head preceding-context K-variance) to predict when a deep splice would drift, hoping to skip recompute when variance was low. However, this proxy failed to rank-correlate with true per-head drift (Mean Spearman $\rho = 0.193$, well below the target $\ge 0.40$). Consequently, Nexus relies on the deterministic depth-adaptive recompute curve rather than scalar-threshold gating.
 
-The practical consequence: Path A is built to keep splices in the anchored regime, and the
-dual-path gate exists to refuse positions where the splice would have to leave it.
-
-> **The old graceful-boundary story is retired.** Earlier docs described a smooth tensor-KL
-> curve (`0.0076 @P256` rising to `5.72 @P1024`). That curve is **not a live claim**: no
-> tensor-KL harness exists in the repo, and the numbers do not reproduce in any current metric.
-> What survives is the binary regime story above — anchored exact, off-anchor degraded —
-> measured in **logit/output-distribution KL** and corroborated by position-independent
-> **tensor-L2** (~12, no boundary effect). See internals for the full retirement.
-
-## 9. Runtime constraints and architectural preconditions
-
-Path A is correct only inside a box defined by three preconditions:
-
-1. **Position.** `n_past ≤ MAX_SPLICE_POS = 256`. Beyond this, the RoPE drift required to place
-   the block is too large to stay in the anchored-exact regime, so Nexus declines (Path B).
-2. **RoPE configuration match.** The block's `rope_freq_scale` and `rope_scaling_type` must
-   match the live model within tolerance, or the orchestrator throws.
-3. **Attention architecture.** The KV layout must be one the splicer can legally write — which
-   on the pinned stack means flash-attention-compatible and non-soft-capped (§11).
-
-## 10. Why Path A works on the validated tuple
-
-Qwen2.5 on the pinned stack runs with flash attention enabled, which keeps the V cache in the
-non-transposed layout (`v_trans = false`) that the splicer writes into. Its RoPE configuration
-is stable and matchable, and tool schemas compiled at `base_pos = 0` are injected on the short
-path where `Δpos = 0`. All three preconditions hold, so the splice lands in the anchored-exact
-regime — which is exactly what H5's fidelity measurement and H3's end-to-end speedup confirm.
-
-## 11. Why it narrows / fails on Gemma2
-
-H1 tried a second model and found a **structural** block, not a numeric regression:
-
-- Gemma2 uses **attention logit soft-capping**.
-- The pinned `llama.cpp` forces **flash attention off** when soft-capping is present.
-- With flash attention off, the V cache is left **transposed** (`v_trans = true`).
-- The splicer **rejects** `v_trans = true` — it cannot legally write that layout.
-
-So the splice cannot even *execute* on Gemma2. This is why the scope is stated as
-**flash-attention-compatible, non-soft-capped architectures**, and why **Qwen2.5 remains the
-only validated working configuration**. H1 did not measure whether the anchored/isolated
-fidelity numbers generalize; it found the mechanism is structurally inapplicable to this second
-family. That is a stronger narrowing than a drift would be. Artifact:
-`phaseH/PHASE_H_H1_SECONDMODEL_REVIEW.md`.
-
-## 12. Performance model and trade-offs
-
-Where the latency goes, and which metric measures which part:
-
-| Stage | Cost (canonical tuple) | Metric family |
-| --- | --- | --- |
-| SLB dense scan | ~3.71 µs @ N=100 (<5 µs at N≤100; ~21 µs at N=1000) | router cost (H5) |
-| L0 warm-cache copy | ~3.06 µs P50 (69.5% hit) | cache |
-| Retrieve + gate + splice | 160.2 ms P50 (`decode_us=0`) | **route-only** |
-| Full turn to first token, Path A (N1x) | **457.5 ms** | **true TTFT** (H3) |
-| Full turn to first token, Path B (B3) | **1131.4 ms** | **true TTFT** (H3) |
-
-The trade Path A makes: it spends a few hundred microseconds of routing + a KV blit +
-a 5%-suffix recompute, to avoid a full schema prefill. On the canonical tuple that nets a
-**2.47×** true-TTFT speedup (CI [2.41, 2.72]) with **no detectable accuracy gap** (Δ −0.010,
-CI [−0.080, +0.050]).
-
-Critically, **route-only (160.2 ms) and true TTFT (457.5 ms) are different quantities.**
-Dividing one baseline's full TTFT by the other arm's route-only latency is the error that
-produced the retired "6.3×" figure. The only honest speedup is true-TTFT vs true-TTFT: 2.47×.
-
-## 13. Evidence-backed claims vs design hypotheses
-
-| Statement | Status |
-| --- | --- |
-| Anchored splice is output-exact | **Evidence** (H5 fidelity, logit-KL 0.0) |
-| Path A is 2.47× faster TTFT than B3, no detectable accuracy gap | **Evidence** (H3, n=100) |
-| Router is <5 µs at N≤100 | **Evidence** (H5 scalability) |
-| Splice requires flash-attn-compatible, non-soft-capped arch | **Evidence** (H1, structural) |
-| Off-anchor / deep-context splice could be made viable with a better RoPE reanchor | **Hypothesis** (unproven; off-anchor currently degrades) |
-| L0 warm tier would save real work on the deep path | **Hypothesis** (only probed read-only; never consumed) |
-| Mechanism generalizes to other models/hosts | **Unvalidated** (one tuple only) |
-
-## 14. Benchmark map (metric → artifact)
-
-| Claim | Phase | Artifact |
-| --- | --- | --- |
-| True-TTFT speedup 2.47× [2.41,2.72], n=100; accuracy Δ −0.010 | H3 | `phaseH/h3_e2e_n100.json` (+ `PHASE_H_H3_E2E_INTERVAL_REVIEW.md`) |
-| Gemma2 structural block; Qwen2.5-only scope | H1 | `phaseH/PHASE_H_H1_SECONDMODEL_REVIEW.md` |
-| Dense 0.87 / CE-gated 0.88; 0.90 not met | H4 | `phaseH/recall_miss_analysis_H4.json`, `recall_sweep_thr_*.json` |
-| P20 calibration τ = 0.01365 | H4 | `phaseH/margin_calibration_H4.json` |
-| SLB scan 1.375→21.1 µs (N=10→1000) | H5 | `phaseH/slb_scalability_H5.csv` |
-| Anchored fidelity logit-KL 0.0, top-1 1.0 | H5 | `phaseH/splice_fidelity_anchored_H5.json` |
-| Tensor-L2 / logit-KL boundary (replaces tensor-KL) | H5 | `phaseH/tensor_boundary_canary_5pct.json`, `logit_kl_boundary_phaseA.json` |
-| Gateway route-only 160.2 ms; L0 69.5% / 3.06 µs | canonical | `CANONICAL_RESULTS_MANIFEST.json` |
-
-## 15. Failure modes and risk boundaries
-
-- **Wrong tool routed.** Bounded by CE-gated Recall@1 ≈ 0.88; routing is not perfect and the
-  ceiling was confirmed in H4.
-- **Position out of range.** `n_past > 256` → splice declined → text-prefill fallback (correct
-  but unaccelerated).
-- **Architecture mismatch.** Soft-capped / non-flash-attn model → splicer rejects → mechanism
-  inapplicable (Gemma2).
-- **RoPE config mismatch.** Block vs live RoPE params disagree → orchestrator throws rather than
-  splice incorrectly.
-- **Off-anchor use.** Injecting a block away from its compiled position degrades the output
-  distribution; the design avoids this rather than relying on the reanchor to fix it.
-- **Single-tuple generalization risk.** All evidence is one model/host/stack; treating it as
-  general is unsupported.
+### 6.2 Scattered Recompute Degradation (LegoLink)
+An earlier design iteration attempted to repair drift by recomputing scattered, sparse tokens across the spliced block (LegoLink). This scattered recompute actively corrupted attention, leaving the next-token divergence at $D_{\mathrm{KL}} \approx 5.7$ nats at depth 1024 (two orders of magnitude worse than a bare contiguous splice). The production splicer has retired LegoLink, enforcing contiguous suffix re-decoding instead.

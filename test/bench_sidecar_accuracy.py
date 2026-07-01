@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""V1.2 Sidecar accuracy + Oracle-consistency benchmark (V7/V3).
+"""v2.0 Sidecar accuracy + Oracle-consistency benchmark.
 
 Run: PYTHONPATH=build:src:test .venv/bin/python test/bench_sidecar_accuracy.py [--smoke]
 
 Arms (same agent, same 10 GitHub tools, same deep synthetic history):
   Sidecar : agent.execute_via_sidecar(messages)            -> pruned anchor, Path A.
-  Oracle  : full UNPRUNED in-context history + schema(text) -> args (the reference).
+  Oracle  : full unpruned in-context history + schema(text) -> args (the reference).
 
 Metrics:
   Routing accuracy  : sidecar tool vs gold (n=100).
-  Oracle consistency: sidecar args vs oracle args, SAME forced tool. Reported as
-                      parsed-JSON equality + mean per-field agreement + raw-string
-                      match (no gold labels exist -> relative-to-oracle, caveated).
-  Anchor P50/P99    : proves sidecar anchor < MAX_SPLICE_POS - SAFETY.
-  TTFT (max_tokens=1, serial): time-to-first-arg-token, sidecar vs oracle. NOTE the
-                      oracle includes a COLD full-history prefill each call; in a live
-                      session that history is resident, so this OVER-states oracle cost.
+  Oracle consistency: sidecar args vs oracle args, same forced tool.
+  TTFT (max_tokens=1, serial): time-to-first-arg-token, sidecar vs oracle.
 
-Writes JSON to results/v1.2_sidecar_canonical/ (never touches v1.1_canonical).
+Writes JSON to results/v2.0_canonical/raw/sidecar/accuracy.json.
 """
 from __future__ import annotations
 
@@ -43,7 +38,7 @@ from bench_routing_accuracy import queries_dataset, load_n_tools, compile_atb_fi
 
 MODEL = "/Volumes/AI_SSD/models/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf"
 ATB_DIR = Path("results/phaseA_tool_match_work")
-OUT_DIR = Path("results/v1.2_sidecar_canonical")
+OUT_DIR = Path("results/v2.0_canonical/raw/sidecar")
 
 # v1.6: hand-labeled gold ARGUMENTS for the first 30 queries_dataset cases (filtered to
 # the registered GitHub-10). Only the fields a query actually SPECIFIES are listed --

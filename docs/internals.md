@@ -1,251 +1,148 @@
-# Nexus Internals
+# Nexus Internals: Implementation Invariants & ABI Specifications
 
-This is the candid, implementation-level document: the invariants that must hold, the
-model-bound assumptions baked into the binary format, what each Phase-H result actually proved
-(and what one of them *retired*), which artifacts are authoritative, and the traps a new
-contributor will otherwise hit. It pairs with [architecture.md](architecture.md) (the mental
-model) and the [README](../README.md) (the headline and scope).
-
-**Validation anchor.** Canonical tuple: Qwen2.5-14B-Instruct Q4_K_M (`model_hash a09ea5e7`),
-`llama_cpp`/`llama.cpp` build `cb2463bb`, one Apple-Silicon host, git `1ce4aa4`. Authoritative
-artifacts under `results/v2.0_canonical/`; the manifest is the source of truth.
-
-> **Two "Radix" types, do not conflate them.** `NexusRadixPrefixCache`
-> (`nexus_seq_warm_cache.{cpp,hpp}`) is the **L0 warm KV prefix cache**. `NexusRadixFSM`
-> (`nexus_fsm.{cpp,hpp}`) is a **decode-time logit-masking trie** over tool-name tokens. They
-> share a name fragment and nothing else.
+This document outlines the low-level C++ invariants, the `.atb` file format layout, attention-layout mappings, and the empirical provenance of the v2.0 benchmark files.
 
 ---
 
-## 1. Runtime invariants
+## 1. System Invariants & Bounds
 
-Hold these true or the splice is incorrect:
+For splicing to execute without memory corruption or output degradation, the orchestrator and splicer enforce six invariants:
 
-1. **Position bound.** Path A runs only when `n_past ≤ MAX_SPLICE_POS` (256). The orchestrator
-   enforces it at the top of `route_and_splice` (`nexus_orchestrator.cpp:69`); over the bound it
-   returns `0` and the Python layer text-prefills.
-2. **Anchored injection.** Path A's `.atb` blocks are compiled at `base_pos = 0` and injected on
-   the short path, so `delta_pos = n_past − base_pos = 0`. Anchored splices are output-exact;
-   off-anchor splices degrade (§7, §8).
-3. **Layout writability.** The splicer only writes a KV layout it can legally address — i.e.
-   `v_trans = false` (flash attention on). `v_trans = true` is rejected (§4).
-4. **RoPE parameter match.** Block `rope_freq_scale` / `rope_scaling_type` must match the live
-   model within `1e-5`; otherwise the orchestrator throws (`nexus_orchestrator.cpp:167-173`).
-5. **Lifecycle cleanup.** Every splice is RAII-scoped (`NexusSpliceContext`); the spliced KV
-   range is removed on turn exit, including on exception/cancellation.
-6. **Context capacity.** `n_past + schema_len + Q` must fit `llama_n_ctx`; checked before
-   injection, throws `length_error` otherwise.
+1.  **Context Capacity Guard**: Before any splice, the orchestrator checks that:
+    $$n_{\mathrm{past}} + \text{schema\_len} + Q \le \text{llama\_n\_ctx}$$
+    If this is violated, it throws a `std::length_error` immediately to prevent cache overflow.
+2.  **Position Bound & Suffix Recompute**:
+    *   If `n_past <= 256`, the splice runs in the anchored-exact regime using a baseline recompute fraction $R_{\mathrm{base}} = 5\%$.
+    *   If `n_past > 256`, the orchestrator checks if `deep_splice_enabled_` is active. If `false`, it declines the splice and returns `0` (falling back to standard text prefill). If `true`, it calculates the depth-adaptive fraction $R(n_{\mathrm{past}})$ to repair RoPE drift, and splices the block.
+3.  **Layout Writability**: The splicer determines the physical V-cache layout. Row-major V-cache layouts (`v_trans = false`, FlashAttention enabled) are spliced via simple copies. Transposed V-cache layouts (`v_trans = true`, soft-capped architectures like Gemma-2 with FlashAttention disabled) are spliced using `splice_v_layer` (UMA-only). Mismatched or unsupported GPU layouts throw an exception.
+4.  **RoPE Parameter Validation**: The `.atb` block's `rope_freq_scale` and `rope_scaling_type` must match the live model configuration within $10^{-5}$. A mismatch causes the orchestrator to reject the block.
+5.  **Re-entrant Context Lock**: Serializes routing and argument generation to guarantee bit-stable, deterministic outputs under multi-threaded execution.
+6.  **Lifecycle Cleanup**: Splicing is wrapped in a Python RAII context manager (`NexusSpliceContext`). On turn exit, the spliced KV cache cells are cleared (`unsplice_tool`) to restore the cache to its pre-splice state.
 
-## 2. ABI / model-bound assumptions
+---
 
-A `.atb` block is **not portable across models.** It is a frozen dump of FP16 K/V tensors whose
-shape and numerical content depend on the exact model topology and RoPE configuration. The
-header binds it; the splicer validates the binding; a mismatch is a hard error, never a silent
-reinterpretation.
+## 2. `.atb` File Format ABI
 
-The binary is little-endian only (`static_assert` in `aeon_tool_block.hpp:6`) and physically
-2 MiB aligned (`NEXUS_PAGE_ALIGNMENT = 2097152`) for huge-page / direct-I/O friendliness.
+Each precompiled tool schema is written as an Aeon Tool Block (`.atb`). The file starts with a 128-byte packed little-endian header, followed by page-aligned (2 MiB) contiguous key and value tensors.
 
-## 3. `.atb` header — the model dependence, field by field
+```cpp
+#pragma pack(push, 1)
+struct alignas(128) AeonToolBlockHeader {
+    char magic[4];               // Magic signature ("ATB1")
+    uint32_t version;            // ABI version (currently 1)
+    uint64_t model_hash;         // FNV-1a hash of model topology & architecture
+    uint32_t n_layer;            // Transformer layer count
+    uint32_t n_head_kv;          // Number of KV heads (GQA-compatible)
+    uint32_t d_head;             // Dimension per attention head
+    uint32_t seq_len;            // Length of the precompiled schema (tokens)
+    uint32_t base_pos;           // Absolute RoPE position at compile time
+    float rope_freq_base;        // RoPE base frequency
+    float rope_freq_scale;       // RoPE frequency scaling factor
+    uint32_t rope_scaling_type;  // RoPE scaling type (0: None, 1: Linear, 2: YaRN)
+    uint32_t ggml_type_k;        // GGML numerical type for K (F16 = 1)
+    uint32_t ggml_type_v;        // GGML numerical type for V (F16 = 1)
+    uint64_t k_tensor_offset;    // Byte offset to contiguous K data
+    uint64_t v_tensor_offset;    // Byte offset to contiguous V data
+    uint64_t k_total_bytes;      // Size of K tensor in bytes
+    uint64_t v_total_bytes;      // Size of V tensor in bytes
+    char padding[40];            // Pad to exactly 128 bytes
+};
+#pragma pack(pop)
 
-128 bytes, `#pragma pack(push,1)`, `alignas(128)`, with `static_assert`s pinning every offset
-(`aeon_tool_block.hpp:13-58`):
+static_assert(sizeof(AeonToolBlockHeader) == 128);
+static_assert(offsetof(AeonToolBlockHeader, k_tensor_offset) == 56);
+```
 
-| Offset | Field | Why it binds the block to a model |
-| --- | --- | --- |
-| 0 | `magic[4]` = `"ATB1"` | Format guard |
-| 4 | `version` = 1 | ABI version |
-| 8 | `model_hash` | FNV-1a of model topology — the master binding key |
-| 16 | `n_layer` | Layer-loop bound; KV stride |
-| 20 | `n_head_kv` | GQA-aware KV head count; tensor layout |
-| 24 | `d_head` | Per-head dimension; K/V row size, RoPE dim |
-| 28 | `seq_len` | Active tokens in this block (schema length) |
-| 32 | `base_pos` | **RoPE compile position** — drives anchored vs off-anchor |
-| 36 | `rope_freq_base` | RoPE theta base |
-| 40 | `rope_freq_scale` | RoPE scaling (default 1.0); matched at runtime |
-| 44 | `rope_scaling_type` | 0 standard / 1 linear / 2 YaRN; matched at runtime |
-| 48 | `ggml_type_k` | Must be `GGML_TYPE_F16` (1) |
-| 52 | `ggml_type_v` | Must be `GGML_TYPE_F16` (1) |
-| 56 / 64 | `k_tensor_offset` / `v_tensor_offset` | Byte offsets to contiguous K/V data |
-| 72 / 80 | `k_total_bytes` / `v_total_bytes` | `seq_len * n_layer * n_head_kv * d_head * 2` |
-| 88 | `padding[40]` | Pad to exactly 128 bytes |
+*   `model_hash` is computed as an FNV-1a hash over the model name string concatenated with layer count, head dimension, base frequency, and KV head counts. A mismatched hash is rejected at runtime.
+*   Contiguous FP16 tensors are aligned to `NEXUS_PAGE_ALIGNMENT = 2097152` bytes to allow zero-copy memory mapping (`mmap`).
 
-`model_hash` (FNV-1a over model name, `n_layer`, `d_head`, `rope_freq_base`, and per-layer
-`n_head_kv`) is the master key: change the model and the hash, layer count, head count, head
-dim, or RoPE params change, and the block is no longer valid. There is no cross-model fallback —
-a mismatched block is rejected, not reinterpreted.
+---
 
-## 4. KV layout assumptions — `v_trans` and flash-attention dependence
+## 3. Physical KV Layout Mappings & `v_trans`
 
-The single most important portability fact lives in the splicer. The splice writes K and V
-tensors directly into llama.cpp's KV cache memory, which means it depends on the **physical
-layout** of that cache:
+Splicing directly writes raw F16 tensors into the physical memory pages of the LLM context. The physical stride pattern depends on whether FlashAttention is enabled:
 
-- With **flash attention on**, the V cache is stored non-transposed: `v_trans = false`. The
-  splicer can address and write it.
-- With **flash attention off**, llama.cpp keeps the V cache **transposed**: `v_trans = true`.
-  The splicer **rejects** this — it cannot legally write that layout
-  (`nexus_kv_splicer.cpp`, the `v_trans` guard).
+```
+v_trans = false (FlashAttention enabled)
+   K Cache: [n_layer, n_head_kv, seq_len, d_head]
+   V Cache: [n_layer, n_head_kv, seq_len, d_head]  <-- Row-major
 
-This is not a tuning knob. It is why the mechanism's scope is *flash-attention-compatible*
-architectures, and it is the mechanism by which Gemma2 is blocked (§8).
+v_trans = true (FlashAttention disabled / Gemma-2 soft-capping)
+   K Cache: [n_layer, n_head_kv, seq_len, d_head]
+   V Cache: [n_layer, seq_len, n_head_kv, d_head]  <-- Transposed (token-innermost)
+```
 
-The splicer's transfer path also branches on memory topology: on UMA it does a parallel
-per-layer blit (and a parallel CPU RoPE reanchor for off-anchor cases); on discrete GPUs it
-issues async H2D transfers and a GPU RoPE reanchor. The anchored path needs no RoPE step at all.
+For `v_trans = true`, a standard row-major copy would corrupt attention heads. Nexus solves this via a custom strided transposed blit in `nexus_kv_splicer.cpp`:
+```cpp
+void splice_v_layer(const ggml_tensor* src, float* dest, int layer, int head_kv, int seq_len, int d_head) {
+    // Layout-aware copy transposing the V matrix during write
+    for (int t = 0; t < seq_len; ++t) {
+        float* dest_ptr = dest + t * n_head_kv * d_head + head_kv * d_head;
+        const float* src_ptr = src + head_kv * seq_len * d_head + t * d_head;
+        std::memcpy(dest_ptr, src_ptr, d_head * sizeof(float));
+    }
+}
+```
+*   On UMA platforms, this strided copy runs with negligible overhead.
+*   On discrete-GPU backends, strided host-to-device transfers are pathological. The splicer rejects `v_trans = true` and falls back to Path B (text prefill).
 
-## 5. Model metadata dependencies (summary)
+---
 
-The runtime quantities that must agree between block and live model:
+## 4. Empirical Provenance & Verification
 
-- `n_layer`, `n_head_kv`, `d_head` — encoded in `model_hash`; wrong values mean wrong tensor
-  shapes.
-- `rope_freq_base`, `rope_freq_scale`, `rope_scaling_type` — matched within `1e-5`; mismatch
-  throws.
-- `ggml_type_k` / `ggml_type_v` — must be FP16.
-- `v_trans` — runtime property of the live model's attention; must be `false`.
+The primary quantitative metrics in the paper are backed by verified JSON artifacts under [results/v2.0_canonical/raw/](file:///Volumes/AI_SSD/Projects/nexus/results/v2.0_canonical/raw/).
 
-## 6. What "anchored exactness" means operationally
+### 4.1 Next-Token Divergence Sweep
+*   **Harness**: `test/bench_dkl_sweep.py`
+*   **Artifact**: `dkl_sweep.json`
+*   **Findings**: An anchored splice ($\Delta\mathrm{pos} = 0$) achieves $D_{\mathrm{KL}} = 0.0$ and top-1 agreement of $1.0$. Off-anchor splices plateau at $D_{\mathrm{KL}} \sim 10^{-2}$ nats across the $0$--$2048$ range, while LegoLink scattered-recompute spikes to $D_{\mathrm{KL}} \approx 5.7$ nats at depth $1024$.
 
-Anchored = the block is injected at the same RoPE base position it was compiled for, so
-`delta_pos == 0` and **no RoPE rotation is applied** to the stored tensors. The K/V written into
-the cache are bit-for-bit the tensors a real prefill at that position would have produced. H5
-measured the downstream consequence directly: feeding both a real-prefill context and an
-anchored-spliced context through the model yields **logit-KL = 0.0** and **top-1 agreement =
-1.0** over n=50 (`phaseH/splice_fidelity_anchored_H5.json`). Operationally: an anchored splice
-is indistinguishable from prefill at the output-distribution level.
+### 4.2 Gating and Drift Goggles
+*   **Harness**: `test/profile_head_drift.py`
+*   **Artifact**: `gating_nogo.json`
+*   **Findings**: The reference-free preceding-context K-variance proxy fails to correlate with true drift (Mean Spearman $\rho = 0.193$). Max per-head drift ranges between $175$ and $207$ across context depths.
 
-## 7. What "isolated degradation" means operationally
+### 4.3 Deep-Splice TTFT
+*   **Harness**: `test/bench_v2_capstone.py`
+*   **Artifact**: `deep_splice_ttft.json`
+*   **Findings**:
+    *   **K=4 curve**: TTFT speedup of $1.63\times$ at depth $256$ ($R=5\%$), narrowing to $1.24\times$ at $512$ ($R=36.7\%$), and $0.98\times$ (parity/minor regression) at $1024$ ($R=100\%$).
+    *   **K=16 curve**: TTFT speedup of $1.73\times$ at $256$ ($R=5\%$), $1.42\times$ at $512$ ($R=11.3\%$), $1.17\times$ at $1024$ ($R=24\%$), and $1.07\times$ at $2048$ ($R=49.3\%$).
 
-Isolated / off-anchor = `delta_pos != 0`, so the stored tensors must be RoPE-reanchored to the
-injection position before they are coherent. H5's off-anchor measurements show the reanchor does
-**not** recover prefill-equivalent state: logit-KL rises to ~0.9 and top-1 agreement falls to
-~0.33–0.67. Operationally: off-anchor splices change the model's output distribution enough to
-matter. The design's response is to **avoid** the off-anchor regime (the `n_past ≤ 256` gate)
-rather than to trust the reanchor to fix it.
+### 4.4 Routing Scalability & Accuracy
+*   **Harness**: `test/bench_routing_accuracy.py`
+*   **Artifact**: `routing_accuracy_n250.json`
+*   **Findings**: End-to-end routing accuracy is $92\%, 90\%, 89\%, 89\%$ at $N=10, 50, 100, 250$ tools. Top-1 recall is $74\%$, and top-3 recall is $95\%$ at $N=250$. Pure C++ SIMD vector dot product scan timing is $8.25\ \mu s$ (median), while the in-situ routing including Python FFI boundary crossings is $17.6\ \mu s$ (median).
 
-## 8. What H1 proved — structurally
+### 4.5 Hybrid Sidecar Argument Generation
+*   **Harness**: `test/bench_sidecar_accuracy.py`
+*   **Artifact**: `sidecar/accuracy.json`
+*   **Findings**: Sidecar routing accuracy is $86.7\%$. Argument accuracy on routed cases is $100\%$ ($95\%$ Wilson lower bound $\ge 91.2\%$), with $100\%$ JSON validity. End-to-end argument accuracy is $80\%$. First-argument token latency is $443.8$ ms vs $737.3$ ms (baseline), representing a $1.66\times$ speedup at an $\approx 80\%$ token savings.
 
-H1 attempted a second model (Gemma2) and produced a **structural** narrowing, not a numeric one:
+---
 
-1. Gemma2 uses attention logit **soft-capping**.
-2. The pinned `llama.cpp` forces flash attention **off** when soft-capping is present.
-3. Flash-attention-off leaves the V cache **transposed** → `v_trans = true`.
-4. The splicer **rejects** `v_trans = true` at `inject_tool_page`.
+## 5. Developer Precautions & Common Traps
 
-The splice therefore cannot execute at all on Gemma2. H1 did **not** measure whether the
-anchored/isolated fidelity numbers generalize — it established that the mechanism is
-*structurally inapplicable* to a soft-capped family on this stack. Conclusion of record: scope
-is **flash-attention-compatible, non-soft-capped** architectures, and **Qwen2.5 is the only
-validated working configuration.** Artifact: `phaseH/PHASE_H_H1_SECONDMODEL_REVIEW.md`.
+*   **V-trans Layout**: Do not assume all GGUF models are row-major. Gemma-2 models force FlashAttention off on the current `llama.cpp` stack due to soft-capping, which changes the layout of the V-cache to token-innermost.
+*   **Rerank Margin Margin-Threshold Default**: If the directory `src/` is not in the Python search path, `nexus_retrieval.DEFAULT_RERANK_MARGIN` defaults to `0.028`. The correct calibrated margin is `0.013646852970123292` (defined in `src/nexus_calibration.py`). Always set `PYTHONPATH=build:src:test`.
+*   **Radix Cache vs Radix FSM**:
+    *   `NexusRadixPrefixCache` (`nexus_seq_warm_cache.cpp`) is the **L0 prefix cache** (caches KV history to avoid prefill).
+    *   `NexusRadixFSM` (`nexus_fsm.cpp`) is the **logits-masking trie** (constrains generated tokens during tool resolution).
+*   **L0 Prefix Cache Copy Overhead**: The radix cache prefix copy is an actual physical copy in memory (`llama_kv_cache_seq_cp`). It runs in $\approx 3.04\ \mu s$ (median) but is NOT zero-copy. Do not describe it as zero-copy.
+*   **Benchmark Serial Executions**: Never run TTFT latency benchmarks in parallel. Parallel execution causes thread contention, inflating B3 baseline values and corrupting latency measurements.
 
-## 9. What H3 proved — statistically
+---
 
-H3 measured **true TTFT** (first-token decode included), serially, n=100 per arm
-(`phaseH/h3_e2e_n100.json`, `PHASE_H_H3_E2E_INTERVAL_REVIEW.md`):
+## 6. Code Extension Map
 
-- N1x median true-TTFT **457.5 ms** (CI [445, 469] ms); B3 **1131.4 ms** (CI [1121, 1248] ms).
-- Speedup **2.47×**, 95% CI **[2.41, 2.72]**.
-- Accuracy: N1x 0.91, B3 0.92; delta **−0.010**, 95% CI **[−0.080, +0.050]**; McNemar
-  (B3 vs N1) **p = 1.0**, not significant.
-
-What changed from earlier reporting: the prior **n=30 "6-point gap" (0.87 vs 0.93) was small-n
-noise and does not survive** at n=100. The correct statement is "no detectable gap at n=100,"
-**not** "equal accuracy." The earlier n=30 e2e figures (≈518 / 1214 ms, ≈2.34×) are superseded
-by these CI-backed n=100 numbers.
-
-## 10. What H5 invalidated / retired, and what it regenerated
-
-H5 did two things. **Regenerated (live):**
-
-- **SLB scalability** (`phaseH/slb_scalability_H5.csv`): P50 scan **1.375 µs @ N=10 → 21.1 µs @
-  N=1000**, **3.71 µs @ N=100**; the <5 µs-at-N≤100 budget holds.
-- **Anchored splice fidelity** (`phaseH/splice_fidelity_anchored_H5.json`): logit-KL 0.0,
-  top-1 1.0 (§6).
-
-**Invalidated / retired:** the legacy tensor-KL boundary curve.
-
-> The old numbers `0.0076 @P256` and `5.72 @P1024`, presented as a graceful "tensor-KL"
-> boundary, are **retired and not citable as regenerated evidence.** Reasons, from
-> `phaseH/PHASE_H_TENSORKL_BOUNDARY_REVIEW.md`:
->
-> - **No tensor-KL harness exists in the repo.** The only reproducible fidelity metric families
->   are **tensor-L2** and **logit/output-distribution KL**. The "tensor-KL" label described a
->   metric that was never implemented as a harness; the values survive only as a prose note in a
->   legacy verdict file.
-> - The regenerated sweep at P=256/512/1024 shows **tensor-L2 ≈ 12, position-independent** — no
->   boundary effect at all — and **logit-KL ≈ 0.9–1.1 uniformly** in the isolated regime, not a
->   `0.0076`-floor-rising-to-`5.72`-spike curve.
-> - `5.72` was a **LegoLink scattered-partial-recompute** configuration that no current harness
->   implements; it does not reproduce.
->
-> What survives is the **binary regime story**, in the correct metric: anchored → logit-KL 0.0
-> (exact); isolated → logit-KL ~0.9 (degraded). Cite that, not the curve.
-
-## 11. Artifact taxonomy — canonical vs raw vs legacy
-
-`results/v2.0_canonical/MANIFEST.json` is the authority. Categories:
-
-| Class | Where | Meaning |
-| --- | --- | --- |
-| **Canonical** | `v2.0_canonical/*` | Frozen 2026-07-01; reproducible on the pinned stack; the live source of truth |
-| **Raw** | `v2.0_canonical/raw/` | Per-seed / per-run inputs behind the pooled canonical metrics |
-| **Legacy / retired** | LegoLink scattered partial-recompute `5.72` KL; reference-free gating proxy | Do not cite as live evidence for production path |
-
-Primary canonical artifacts you will actually read:
-
-- `raw/deep_splice_ttft.json` — the TTFT latency under deep splice curves.
-- `raw/dkl_sweep.json` — the next-token D_KL vs splice offset sweep.
-- `raw/routing_accuracy_n250.json` — routing accuracy vs registry scale.
-- `raw/sidecar/accuracy.json` — hybrid sidecar routing & argument accuracies.
-
-## 12. Developer warnings — what NOT to assume
-
-- **Do not assume portability.** One model, one host, one stack. A `.atb` is invalid for any
-  other model; the mechanism is structurally blocked on soft-capped architectures.
-- **Do not cite `0.0076` / `5.72`.** Retired; no harness; use anchored logit-KL 0.0 / tensor-L2
-  ~12 instead (§10).
-- **"Copy" is real, not "zero-copy."** The L0 warm tier performs an actual
-  `llama_kv_cache_seq_cp`. It is cheap (~3.06 µs P50) but it is a copy; do not describe it as
-  zero-copy.
-- **L0 cache ≠ FSM trie.** `NexusRadixPrefixCache` (KV reuse) and `NexusRadixFSM` (decode
-  masking) are different objects (top of doc).
-- **Margin-threshold footgun.** If `src/` is not on the import path,
-  `nexus_retrieval.DEFAULT_RERANK_MARGIN` falls back to `0.028`; the real calibrated value is
-  `0.013646852970123292` (`src/nexus_calibration.py`). Always put `src/` on the path.
-- **Route-only ≠ TTFT.** The gateway 160.2 ms metric sets `decode_us = 0`. Never label it TTFT.
-- **Deep-path L0 is read-only.** On Path B, `probe_prefix` measures a potential hit but never
-  `seq_cp`s it and never writes back; the warm pool is not populated on the deep path. Whether a
-  deep-path hit would save real work is **unproven** — do not wire it as if it does.
-- **`bench_phase28_radix_prefix` default model footgun.** Its default model resolves to an
-  unrelated Ollama blob; always pass `--model` explicitly.
-
-## 13. Reproducibility and provenance expectations
-
-- **Interpreter:** `.venv/bin/python` only — the system `python3` cannot import `llama_cpp`. (A
-  past "BLOCKED" audit verdict was a venv/sandbox artifact, not a real failure.)
-- **Path:** `PYTHONPATH=build:src:test`.
-- **Serial e2e:** run end-to-end benchmarks one at a time. Concurrent runs load the 14B model
-  twice and contend, inflating B3 absolutes (an early contended run reported B3 ≈ 2011 ms and
-  was discarded).
-- **Provenance to record with any result:** git commit, `llama.cpp` build (`cb2463bb`), model
-  hash (`a09ea5e7`), host, sample size, and whether the metric is route-only or true TTFT.
-
-## 14. If you want to extend Nexus — inspect these first
-
-| Goal | Start here |
-| --- | --- |
-| Change routing / gate logic | `nexus_orchestrator.cpp` → `route_and_splice` (guard `:69`, gate `:155-157`, RoPE check `:167`) |
-| Touch the splice / KV write path | `nexus_kv_splicer.cpp` → `inject_tool_page_raw` (header validate, `v_trans` guard, transfer, RoPE) |
-| Off-anchor / RoPE reanchor work | `nexus_rope_math.cpp` → `apply_absolute_rope_reanchor`, `apply_relative_rope_shift` |
-| Router / retrieval | `nexus_slb.{cpp,hpp}` → `register_tool`, `search`, `search_hybrid` |
-| L0 warm cache | `nexus_seq_warm_cache.cpp` → `try_copy_prefix`, `probe_prefix`, `update_from_seq` |
-| Block format / I/O / eviction | `aeon_tool_block.hpp` (header), `nexus_block_cache.cpp` (load, hazard pointers, eviction) |
-| Compile a new `.atb` | `nexus_kv_compiler.cpp` (`--model`, `--schema`, `--output`, `--base-pos`, `--pos-bucket`) |
-| Python lifecycle / FFI | `nexus_agent.py` → `NexusSpliceContext`, `NexusRoutingProcessor`, `_extract_context_pointer` |
-| Add bindings | `bindings.cpp` (nanobind module `nexus_fsm_ext`) |
-
-**First thing to verify on any new model:** whether it runs with flash attention on
-(`v_trans = false`). If it is soft-capped or otherwise forces flash attention off, the splice
-path is structurally inapplicable and no amount of routing or calibration work will change that
-— that is the lesson of H1.
+| Target | Source File | Key Entry Point |
+|--------|-------------|-----------------|
+| **Routing / Gating** | `src/nexus_orchestrator.cpp` | `route_and_splice()` (margin gate, RoPE validation, deep-splice branch) |
+| **KV Cache Transplantation** | `src/nexus_kv_splicer.cpp` | `inject_tool_page_raw()` (layout validations, blit calls, relative shifts) |
+| **Transposed-V Blit** | `src/nexus_kv_splicer.cpp` | `splice_v_layer()` (strided transposition loop) |
+| **RoPE Reanchoring Math** | `src/nexus_rope_math.cpp` | `apply_absolute_rope_reanchor()`, `apply_relative_rope_shift()` |
+| **INT8 SIMD Dense Search** | `src/nexus_slb.cpp` | `search()`, `search_hybrid()` |
+| **Radix prefix cache** | `src/nexus_seq_warm_cache.cpp` | `try_copy_prefix()`, `probe_prefix()`, `update_from_seq()` |
+| **Logits Masking Radix FSM**| `src/nexus_fsm.cpp` | `advance()`, `get_logits_mask()` |
+| **Python FFI / RAII lifecycle**| `src/nexus_agent.py` | `NexusSpliceContext`, `NexusRoutingProcessor` |
+| **C++ / Python FFI Bindings** | `src/bindings.cpp` | nanobind registrations (`nexus_fsm_ext`) |

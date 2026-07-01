@@ -342,7 +342,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Nexus routing accuracy benchmark")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="GGUF chat/model path")
     parser.add_argument("--embed-model", default=EMBED_MODEL, help="GGUF embedding model path")
-    parser.add_argument("--output", default="results/bench_routing_accuracy.json", help="JSON artifact path")
+    parser.add_argument("--output", default="results/v2.0_canonical/raw/routing_accuracy_n250.json", help="JSON artifact path")
     parser.add_argument("--seed", type=int, default=1337, help="Deterministic seed for benchmark libraries")
     parser.add_argument("--auto-route-margin", type=float, default=0.10)
     parser.add_argument("--speculative-threshold", type=float, default=0.0)
