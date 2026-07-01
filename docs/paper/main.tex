@@ -246,15 +246,70 @@ deep splice.
 We evaluate splice fidelity by the divergence of the model's next-token distribution from a
 recompute-equivalent reference. At the compile anchor ($\Delta\mathrm{pos}=0$) an anchored
 splice is output-exact: $D_{\mathrm{KL}}(\mathbf{p}_0 \parallel \mathbf{p}_{\mathrm{splice}}) \approx 0$ with $\text{top-1 agreement} = 1.0$. Once the
-block is placed off-anchor, the phase error of \eqref{eq:drift} corrupts the distribution. A
-historical gate study that evaluated a scattered partial-recompute configuration (LegoLink) on a block
-placed at $n_{\mathrm{past}} = 1024$ found that partial recompute leaves the Kullback-Leibler divergence
-as high as $D_{\mathrm{KL}} \approx 5.7$~nats (\code{rope\_boundary\_gate.json}). Because this scattered
-recompute is retired in the current prototype, Nexus enforces a deterministic fallback to a $100\%$
-suffix redecode (prefill parity) beyond $P=256$ to guarantee zero output degradation. This establishes
-the boundary the production splicer enforces---blocking bare splices beyond $n_{\mathrm{past}}=256$---and
-it is exactly the design of \eqref{eq:adaptive}: a deep off-anchor block cannot be trusted cheaply,
-so the repair fraction must escalate with depth until it is indistinguishable from a prefill.
+block is placed off-anchor, the phase error of \eqref{eq:drift} perturbs the distribution.
+Fig.~\ref{fig:dkl} traces this perturbation directly: with recompute \emph{disabled} (a bare splice,
+so the curve shows the raw off-anchor drift the repair must overcome), we sweep the placement offset
+from the anchor to $\Delta\mathrm{pos}=2048$ and measure the next-token divergence against a
+full-prefill reference at each depth ($10$ queries/offset, \code{dkl\_sweep.json}). Two facts stand
+out. First, the RoPE reanchor is effective: the divergence rises from its ${\approx}0$ anchor floor to
+${\sim}10^{-2}$ nats within the first $64$ tokens and then \emph{plateaus}---it stays in the
+$0.008$--$0.038$-nat band, with top-1 agreement $=1.0$, across the entire $0$--$2048$ range, so a
+contiguous-suffix bare splice never fails catastrophically at these depths. The threshold $P=256$ is
+therefore a \emph{conservative} repair-start---where the drift has clearly separated from the anchor
+floor while top-1 is still safe---rather than a sharp fidelity cliff.
+
+Second, the retired scattered partial-recompute configuration (LegoLink) tells the complementary
+cautionary story: at $n_{\mathrm{past}}=1024$ it left the divergence as high as
+$D_{\mathrm{KL}}\approx 5.7$~nats (\code{rope\_boundary\_gate.json})---two orders of magnitude
+\emph{above} the contiguous-suffix bare splice at the same depth (Fig.~\ref{fig:dkl}). Scattered
+recompute thus actively corrupted the distribution rather than repairing it, which is precisely why
+the current design repairs a \emph{contiguous} trailing suffix and why that mechanism is retired.
+The production splicer still blocks bare splices beyond $n_{\mathrm{past}}=256$ and escalates the
+repair fraction of \eqref{eq:adaptive} with depth: the bare drift is small but nonzero, and the
+depth-adaptive redecode drives it to exactly $0$ (Table~\ref{tab:perf}), trading a little TTFT for a
+hard never-regress fidelity guarantee rather than merely a small residual.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=5.0cm,
+  xlabel={bare-splice placement offset $\Delta\mathrm{pos}$ (tokens)},
+  ylabel={$D_{\mathrm{KL}}(\mathbf{p}_0\parallel\mathbf{p}_{\mathrm{splice}})$ (nats)},
+  ymode=log, ymin=1e-4, ymax=12,
+  xmin=-40, xmax=2120, xtick={0,256,512,1024,1536,2048},
+  legend style={font=\scriptsize,at={(0.02,0.97)},anchor=north west,draw=nxgray},
+  grid=both, grid style={gray!18}, tick label style={font=\scriptsize}, label style={font=\scriptsize},
+]
+\addplot[nxblue,mark=*,line width=1pt,error bars/.cd,y dir=both,y explicit]
+  table[row sep=\\,x=x,y=y,y error plus=ep,y error minus=em]{
+  x y ep em \\
+  64 0.0112 0.0182 0.0099 \\
+  128 0.0076 0.0142 0.0072 \\
+  192 0.0103 0.0183 0.0100 \\
+  256 0.0107 0.0187 0.0104 \\
+  320 0.0169 0.0292 0.0164 \\
+  384 0.0376 0.0646 0.0368 \\
+  512 0.0143 0.0176 0.0139 \\
+  768 0.0181 0.0262 0.0180 \\
+  1024 0.0172 0.0248 0.0169 \\
+  1536 0.0139 0.0197 0.0136 \\
+  2048 0.0103 0.0131 0.0098 \\
+};
+\addplot[nxred,mark=triangle*,only marks,mark size=3pt] coordinates {(1024,5.72)};
+\draw[nxgray,dashed,line width=0.8pt] (axis cs:256,1e-4) -- (axis cs:256,12);
+\node[nxgray,font=\scriptsize,anchor=south west] at (axis cs:270,1.5e-4) {$P{=}256$};
+\legend{contiguous bare splice (95\% CI),retired LegoLink (scattered)}
+\end{axis}
+\end{tikzpicture}
+\caption{Bare-splice next-token divergence vs.\ placement offset, recompute disabled
+(\code{dkl\_sweep.json}; $10$ queries/offset, $95\%$ bootstrap CI). The contiguous-suffix splice
+holds $D_{\mathrm{KL}}{\sim}10^{-2}$ nats with top-1 agreement $=1.0$ across the whole $0$--$2048$
+range---two orders of magnitude below the retired LegoLink scattered-recompute point ($5.7$ nats at
+$\Delta\mathrm{pos}{=}1024$). The enforced threshold $P{=}256$ (dashed) is a conservative
+repair-start, not a fidelity cliff.}
+\label{fig:dkl}
+\end{figure}
 
 \subsection{The Failure of Reference-Free Drift Gating}
 \label{sec:gating}
