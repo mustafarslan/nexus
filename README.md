@@ -1,5 +1,7 @@
 # Nexus: Depth-Adaptive KV-Cache Splicing & Retrieval-Decoupled Tool Routing
 
+[![arXiv](https://img.shields.io/badge/arXiv-2608.20397-b31b1b.svg)](https://arxiv.org/abs/2608.20397)
+
 Nexus is a high-performance serving prototype designed to accelerate tool-augmented turns in agentic Large Language Models (LLMs) running on unified memory architectures (UMA). 
 
 In standard Model Context Protocol (MCP) implementations, LLMs must re-encode verbose JSON schemas on every turn. The quadratic cost of prefill dominates the Time-to-First-Token (TTFT) as the tool registry grows. Nexus addresses this bottleneck by:
@@ -62,7 +64,7 @@ If you use this work, please cite the preprint:
 @article{arslan2026nexus,
   title={Nexus: Depth-Adaptive KV-Cache Splicing and Retrieval-Decoupled Tool Routing for Agentic LLMs on Unified Memory},
   author={Arslan, Mustafa},
-  journal={arXiv preprint arXiv:2607.xxxxx},
+  journal={arXiv preprint arXiv:2608.20397},
   year={2026}
 }
 ```
